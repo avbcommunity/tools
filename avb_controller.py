@@ -1138,7 +1138,8 @@ def cmd_stream_info(interface: str, entity_id_str: str) -> None:
 
 
 def cmd_connect(interface: str, talker_id_str: str, listener_id_str: str,
-                format_name: str = None) -> None:
+                format_name: str = None, talker_uid: int = 0,
+                listener_uid: int = 0) -> None:
     """Connect a talker to a listener via ACMP CONNECT_RX_COMMAND.
 
     If format_name is given, sets stream format on both talker (output) and
@@ -1191,19 +1192,127 @@ def cmd_connect(interface: str, talker_id_str: str, listener_id_str: str,
 
     _acmp_command(interface, talker_id_str, listener_id_str,
                   ACMP_MSG_CONNECT_RX_COMMAND, "CONNECT_RX_COMMAND",
-                  ACMP_MSG_CONNECT_RX_RESPONSE, "CONNECT_RX_RESPONSE")
+                  ACMP_MSG_CONNECT_RX_RESPONSE, "CONNECT_RX_RESPONSE",
+                  talker_uid=talker_uid, listener_uid=listener_uid)
 
 
-def cmd_disconnect(interface: str, talker_id_str: str, listener_id_str: str) -> None:
+def cmd_disconnect(interface: str, talker_id_str: str, listener_id_str: str,
+                   talker_uid: int = 0, listener_uid: int = 0) -> None:
     """Disconnect a talker from a listener via ACMP DISCONNECT_RX_COMMAND."""
     _acmp_command(interface, talker_id_str, listener_id_str,
                   ACMP_MSG_DISCONNECT_RX_COMMAND, "DISCONNECT_RX_COMMAND",
-                  ACMP_MSG_DISCONNECT_RX_RESPONSE, "DISCONNECT_RX_RESPONSE")
+                  ACMP_MSG_DISCONNECT_RX_RESPONSE, "DISCONNECT_RX_RESPONSE",
+                  talker_uid=talker_uid, listener_uid=listener_uid)
+
+
+def cmd_get_tx_state(interface: str, talker_id_str: str, talker_uid: int) -> None:
+    """Query GET_TX_STATE on a talker to see its ACMP connection_count."""
+    mac = get_mac_address(interface)
+    controller_id = mac_to_entity_id(mac)
+    talker_id = parse_entity_id(talker_id_str)
+
+    print(f"Interface:     {interface}")
+    print(f"Controller ID: {format_entity_id(controller_id)}")
+    print(f"Target talker: {talker_id_str} (uid={talker_uid})")
+    print(f"Sending GET_TX_STATE_COMMAND...")
+
+    sock = open_raw_socket(interface)
+    seq_id = int(time.monotonic() * 1000) & 0xFFFF
+
+    msg = build_acmp_message(
+        msg_type=ACMP_MSG_GET_TX_STATE_COMMAND,
+        controller_id=controller_id,
+        talker_id=talker_id,
+        listener_id=b"\x00" * 8,
+        talker_uid=talker_uid,
+        listener_uid=0,
+        connection_count=0,
+        seq_id=seq_id,
+    )
+    send_frame(sock, interface, ACMP_MULTICAST, mac, msg)
+
+    start = time.monotonic()
+    while time.monotonic() - start < 3.0:
+        result = recv_frame(sock, timeout=0.2)
+        if result is None:
+            continue
+        _, payload = result
+        if len(payload) < 4 or payload[0] != AVTP_SUBTYPE_ACMP:
+            continue
+        resp = parse_acmp_response(payload)
+        if resp is None or resp["msg_type"] != ACMP_MSG_GET_TX_STATE_RESPONSE:
+            continue
+        if resp["seq_id"] != seq_id:
+            continue
+        print(f"\nReceived GET_TX_STATE_RESPONSE:")
+        print(f"  Status:            {resp['status_name']}")
+        print(f"  Stream ID:         {resp['stream_id']}")
+        print(f"  Talker:            {resp['talker_id']} uid={resp['talker_uid']}")
+        print(f"  Listener:          {resp['listener_id']} uid={resp['listener_uid']}")
+        print(f"  Stream Dest MAC:   {resp['stream_dest_addr']}")
+        print(f"  Connection Count:  {resp['connection_count']}  <-- key field")
+        print(f"  Flags:             0x{resp['flags']:04x}")
+        print(f"  Stream VLAN ID:    {resp['stream_vlan_id']}")
+        return
+    print("No GET_TX_STATE_RESPONSE received within 3 s.")
+
+
+def cmd_direct_disconnect_tx(interface: str, talker_id_str: str,
+                             listener_id_str: str, talker_uid: int,
+                             listener_uid: int) -> None:
+    """Send ACMP DISCONNECT_TX_COMMAND directly to a talker (bypassing
+    the listener). Useful for probing how the talker's ACMP state
+    machine reacts to an explicit disconnect."""
+    mac = get_mac_address(interface)
+    controller_id = mac_to_entity_id(mac)
+    talker_id = parse_entity_id(talker_id_str)
+    listener_id = parse_entity_id(listener_id_str)
+
+    print(f"Interface:     {interface}")
+    print(f"Controller ID: {format_entity_id(controller_id)}")
+    print(f"Talker:        {talker_id_str} uid={talker_uid}")
+    print(f"Listener:      {listener_id_str} uid={listener_uid}")
+    print(f"Sending DISCONNECT_TX_COMMAND directly to talker...")
+
+    sock = open_raw_socket(interface)
+    seq_id = int(time.monotonic() * 1000) & 0xFFFF
+    msg = build_acmp_message(
+        msg_type=ACMP_MSG_DISCONNECT_TX_COMMAND,
+        controller_id=controller_id,
+        talker_id=talker_id,
+        listener_id=listener_id,
+        talker_uid=talker_uid,
+        listener_uid=listener_uid,
+        connection_count=0,
+        seq_id=seq_id,
+    )
+    send_frame(sock, interface, ACMP_MULTICAST, mac, msg)
+
+    start = time.monotonic()
+    while time.monotonic() - start < 3.0:
+        result = recv_frame(sock, timeout=0.2)
+        if result is None:
+            continue
+        _, payload = result
+        if len(payload) < 4 or payload[0] != AVTP_SUBTYPE_ACMP:
+            continue
+        resp = parse_acmp_response(payload)
+        if resp is None or resp["msg_type"] != ACMP_MSG_DISCONNECT_TX_RESPONSE:
+            continue
+        if resp["seq_id"] != seq_id:
+            continue
+        print(f"\nReceived DISCONNECT_TX_RESPONSE:")
+        print(f"  Status:            {resp['status_name']}")
+        print(f"  Connection Count:  {resp['connection_count']}")
+        print(f"  Stream ID:         {resp['stream_id']}")
+        return
+    print("No DISCONNECT_TX_RESPONSE received within 3 s.")
 
 
 def _acmp_command(interface: str, talker_id_str: str, listener_id_str: str,
                   cmd_type: int, cmd_name: str,
-                  rsp_type: int, rsp_name: str) -> None:
+                  rsp_type: int, rsp_name: str,
+                  talker_uid: int = 0, listener_uid: int = 0) -> None:
     """Send an ACMP command and wait for a response."""
     mac = get_mac_address(interface)
     controller_id = mac_to_entity_id(mac)
@@ -1224,8 +1333,8 @@ def _acmp_command(interface: str, talker_id_str: str, listener_id_str: str,
         controller_id=controller_id,
         talker_id=talker_id,
         listener_id=listener_id,
-        talker_uid=0,
-        listener_uid=0,
+        talker_uid=talker_uid,
+        listener_uid=listener_uid,
         connection_count=1,
         seq_id=seq_id,
     )
@@ -1332,15 +1441,37 @@ examples:
                            help="Stream format to set on both endpoints before connecting. "
                                 "Options: am824-48k, am824-44.1k, am824-96k, aaf-48k, aaf-44.1k, aaf-96k, "
                                 "am824 (alias for am824-48k), aaf (alias for aaf-48k), 61883 (alias for am824-48k)")
+    sp_connect.add_argument("--talker-uid", type=int, default=0,
+                            help="Talker stream output index (default 0)")
+    sp_connect.add_argument("--listener-uid", type=int, default=0,
+                            help="Listener stream input index (default 0)")
 
     # disconnect
     sp_disconnect = subparsers.add_parser("disconnect", help="Disconnect a talker from a listener")
     sp_disconnect.add_argument("talker_entity_id", help="Talker entity ID (colon-separated hex)")
     sp_disconnect.add_argument("listener_entity_id", help="Listener entity ID (colon-separated hex)")
+    sp_disconnect.add_argument("--talker-uid", type=int, default=0,
+                               help="Talker stream output index (default 0)")
+    sp_disconnect.add_argument("--listener-uid", type=int, default=0,
+                               help="Listener stream input index (default 0)")
 
     # stream-info
     sp_info = subparsers.add_parser("stream-info", help="Query stream info for an entity")
     sp_info.add_argument("entity_id", help="Entity ID to query (colon-separated hex)")
+
+    # get-tx-state
+    sp_gts = subparsers.add_parser("get-tx-state",
+        help="Query ACMP GET_TX_STATE on a talker (shows connection_count)")
+    sp_gts.add_argument("talker_id", help="Talker entity ID")
+    sp_gts.add_argument("talker_uid", type=int, help="Talker stream output index")
+
+    # direct-disconnect-tx
+    sp_ddt = subparsers.add_parser("direct-disconnect-tx",
+        help="Send ACMP DISCONNECT_TX_COMMAND directly to a talker")
+    sp_ddt.add_argument("talker_id", help="Talker entity ID")
+    sp_ddt.add_argument("listener_id", help="Listener entity ID (for the command fields)")
+    sp_ddt.add_argument("talker_uid", type=int, help="Talker stream output index")
+    sp_ddt.add_argument("listener_uid", type=int, help="Listener stream input index")
 
     args = parser.parse_args()
 
@@ -1354,11 +1485,19 @@ examples:
         cmd_discover(args.interface, args.duration, show_streams=args.streams)
     elif args.command == "connect":
         cmd_connect(args.interface, args.talker_entity_id, args.listener_entity_id,
-                    format_name=args.format)
+                    format_name=args.format,
+                    talker_uid=args.talker_uid, listener_uid=args.listener_uid)
     elif args.command == "disconnect":
-        cmd_disconnect(args.interface, args.talker_entity_id, args.listener_entity_id)
+        cmd_disconnect(args.interface, args.talker_entity_id, args.listener_entity_id,
+                       talker_uid=args.talker_uid, listener_uid=args.listener_uid)
     elif args.command == "stream-info":
         cmd_stream_info(args.interface, args.entity_id)
+    elif args.command == "get-tx-state":
+        cmd_get_tx_state(args.interface, args.talker_id, args.talker_uid)
+    elif args.command == "direct-disconnect-tx":
+        cmd_direct_disconnect_tx(args.interface, args.talker_id,
+                                 args.listener_id, args.talker_uid,
+                                 args.listener_uid)
 
 
 if __name__ == "__main__":

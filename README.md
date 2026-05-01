@@ -135,6 +135,7 @@ sudo python3 avb_controller.py [--interface IFACE] <command> [args]
 | `connect` | Tell a listener to subscribe to a talker's stream (optionally setting format first). |
 | `disconnect` | Tell a listener to unsubscribe from a talker's stream. |
 | `get-tx-state` | Ask a talker how many listeners are currently connected to one of its outputs. |
+| `clock-source` | Get or set an entity CLOCK_DOMAIN active CLOCK_SOURCE index. |
 | `direct-disconnect-tx` | Send a `DISCONNECT_TX_COMMAND` straight to a talker (diagnostic / state-machine probe). |
 
 ---
@@ -306,6 +307,29 @@ sudo python3 avb_controller.py get-tx-state <talker_id> <talker_uid>
 ```bash
 sudo python3 avb_controller.py get-tx-state 00:1b:21:ff:fe:01:02:03 0
 ```
+
+---
+
+#### `clock-source`
+
+Gets or sets the active CLOCK_SOURCE index for a CLOCK_DOMAIN descriptor.
+Useful for testing internal/gPTP vs CRF/media-clock clock-domain scenarios.
+
+```
+sudo python3 avb_controller.py clock-source <entity_id> [--clock-domain N] [--set SOURCE_INDEX]
+```
+
+Examples:
+
+```bash
+# Read CLOCK_DOMAIN[0] current source
+sudo python3 avb_controller.py -i eno1 clock-source 00:1b:21:ff:fe:01:02:03
+
+# Set CLOCK_DOMAIN[0] to CLOCK_SOURCE[1]
+sudo python3 avb_controller.py -i eno1 clock-source 00:1b:21:ff:fe:01:02:03 --set 1
+```
+
+CRF/media-clock streams can be connected with the normal `connect` command by selecting the CRF stream UIDs, for example `--talker-uid 1 --listener-uid 1` on devices whose CRF stream is index 1.
 
 ---
 

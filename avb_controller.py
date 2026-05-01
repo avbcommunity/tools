@@ -70,12 +70,15 @@ AECP_MSG_AEM_RESPONSE = 1
 AECP_CMD_READ_DESCRIPTOR = 0x0004
 AECP_CMD_SET_STREAM_FORMAT = 0x0008
 AECP_CMD_GET_STREAM_INFO = 0x000F
+AECP_CMD_SET_CLOCK_SOURCE = 0x0016
+AECP_CMD_GET_CLOCK_SOURCE = 0x0017
 
 # AEM descriptor types
 AEM_DESC_TYPE_ENTITY = 0x0000
 AEM_DESC_TYPE_STREAM_INPUT = 0x0005
 AEM_DESC_TYPE_STREAM_OUTPUT = 0x0006
 AEM_DESC_TYPE_STRINGS = 0x000D
+AEM_DESC_TYPE_CLOCK_DOMAIN = 0x0024
 
 # Well-known stream format presets (8 bytes each)
 # IEC 61883-6 AM824: subtype=0, vendor=0, format=0x10, sf=1, fdf_sfc, fdf_evt=0, dbs=8, ...
@@ -687,6 +690,83 @@ def send_set_stream_format(sock, interface: str, mac: bytes, controller_id: byte
 
 
 # ---------------------------------------------------------------------------
+# AECP: GET/SET_CLOCK_SOURCE
+# ---------------------------------------------------------------------------
+
+def build_aecp_clock_source(controller_id: bytes, target_id: bytes,
+                            seq_id: int, command_type: int,
+                            clock_domain_index: int = 0,
+                            clock_source_index: int = 0) -> bytes:
+    """Build AECP GET_CLOCK_SOURCE or SET_CLOCK_SOURCE.
+
+    Both commands act on a CLOCK_DOMAIN descriptor. GET carries
+    descriptor_type/index; SET additionally carries clock_source_index and a
+    reserved uint16. Responses mirror the command family.
+    """
+    is_set = command_type == AECP_CMD_SET_CLOCK_SOURCE
+    control_data_len = 28 if is_set else 24
+    header = encode_atdecc_header(AVTP_SUBTYPE_AECP, AECP_MSG_AEM_COMMAND,
+                                  0, 0, 0, control_data_len)
+    aem = encode_aecp_aem_header(command_type)
+    msg = (header
+           + target_id
+           + controller_id
+           + struct.pack("!H", seq_id)
+           + aem
+           + struct.pack("!HH", AEM_DESC_TYPE_CLOCK_DOMAIN,
+                         clock_domain_index))
+    if is_set:
+        msg += struct.pack("!HH", clock_source_index, 0)
+    return msg
+
+
+def parse_aecp_clock_source_response(payload: bytes) -> dict:
+    """Parse AECP GET/SET_CLOCK_SOURCE response."""
+    if len(payload) < 30:
+        return None
+    subtype, msg_type, sv, version, status_valtime, cdl = decode_atdecc_header(payload[:4])
+    if subtype != AVTP_SUBTYPE_AECP or msg_type != AECP_MSG_AEM_RESPONSE:
+        return None
+    command_type = (((payload[22] >> 2) & 0x3F) << 8) | payload[23]
+    if command_type not in (AECP_CMD_GET_CLOCK_SOURCE, AECP_CMD_SET_CLOCK_SOURCE):
+        return None
+    result = {
+        "target_id": payload[4:12],
+        "seq_id": struct.unpack("!H", payload[20:22])[0],
+        "status": status_valtime,
+        "command_type": command_type,
+        "descriptor_type": struct.unpack("!H", payload[24:26])[0],
+        "descriptor_index": struct.unpack("!H", payload[26:28])[0],
+        "clock_source_index": struct.unpack("!H", payload[28:30])[0],
+    }
+    return result
+
+
+def send_clock_source(sock, interface: str, mac: bytes, controller_id: bytes,
+                      target_id: bytes, target_mac: bytes, seq_id: int,
+                      clock_domain_index: int = 0,
+                      clock_source_index: int = None) -> dict:
+    command_type = (AECP_CMD_GET_CLOCK_SOURCE if clock_source_index is None
+                    else AECP_CMD_SET_CLOCK_SOURCE)
+    msg = build_aecp_clock_source(
+        controller_id, target_id, seq_id, command_type, clock_domain_index,
+        0 if clock_source_index is None else clock_source_index)
+    send_frame(sock, interface, target_mac, mac, msg)
+
+    start = time.monotonic()
+    while time.monotonic() - start < 3.0:
+        result = recv_frame(sock, timeout=0.2)
+        if result is None:
+            continue
+        src_mac_rx, payload = result
+        resp = parse_aecp_clock_source_response(payload)
+        if (resp and resp["target_id"] == target_id and
+                resp["seq_id"] == seq_id and resp["command_type"] == command_type):
+            return resp
+    return None
+
+
+# ---------------------------------------------------------------------------
 # ACMP message building
 # ---------------------------------------------------------------------------
 
@@ -1087,31 +1167,28 @@ def cmd_stream_info(interface: str, entity_id_str: str) -> None:
                     print(f"\n  STREAM {desc_name}[{idx}]: response too short ({len(body)} bytes)")
                     break
 
-                # Parse flags (4 bytes, little-endian bitfield layout)
+                # Parse flags as a 32-bit network-order field per IEEE
+                # 1722.1-2021 Table 7-145.
                 flags_raw = body[0:4]
-                # Byte 0 (LE bitfield): connected(1), msrp_failure_valid(1),
-                #   stream_dest_mac_valid(1), msrp_acc_lat_valid(1),
-                #   stream_id_valid(1), stream_format_valid(1), reserved(2)
-                connected = bool(flags_raw[0] & 0x01)
-                msrp_fail_valid = bool(flags_raw[0] & 0x02)
-                dest_mac_valid = bool(flags_raw[0] & 0x04)
-                acc_lat_valid = bool(flags_raw[0] & 0x08)
-                stream_id_valid = bool(flags_raw[0] & 0x10)
-                fmt_valid = bool(flags_raw[0] & 0x20)
-                # Byte 2: class_b(1), fast_connect(1), saved_state(1),
-                #   streaming_wait(1), supports_encrypted(1), talker_failed(1), reserved(2)
-                class_b = bool(flags_raw[2] & 0x01)
-                streaming_wait = bool(flags_raw[2] & 0x08)
-                talker_failed = bool(flags_raw[2] & 0x20)
-                # Byte 3: no_srp(1)
-                no_srp = bool(flags_raw[3] & 0x01)
+                flags = struct.unpack("!I", flags_raw)[0]
+                fmt_valid = bool(flags & 0x80000000)
+                stream_id_valid = bool(flags & 0x40000000)
+                acc_lat_valid = bool(flags & 0x20000000)
+                dest_mac_valid = bool(flags & 0x10000000)
+                msrp_fail_valid = bool(flags & 0x08000000)
+                connected = bool(flags & 0x04000000)
+                vlan_valid = bool(flags & 0x02000000)
+                no_srp = bool(flags & 0x00000100)
+                talker_failed = bool(flags & 0x00000040)
+                streaming_wait = bool(flags & 0x00000008)
+                class_b = bool(flags & 0x00000001)
 
                 stream_format = body[4:12]
                 stream_id = body[12:20]
                 acc_latency = struct.unpack("!I", body[20:24])[0]
                 dest_addr = body[24:30]
                 msrp_fail_code = body[30]
-                vlan_id = struct.unpack("!H", body[39:41])[0] if len(body) > 40 else 0
+                vlan_id = struct.unpack("!H", body[40:42])[0] if len(body) >= 42 else 0
 
                 fmt_str = _format_stream_format(stream_format)
 
@@ -1120,7 +1197,7 @@ def cmd_stream_info(interface: str, entity_id_str: str) -> None:
                 print(f"    Stream ID:     {format_entity_id(stream_id)} {'(valid)' if stream_id_valid else ''}")
                 print(f"    Connected:     {connected}")
                 print(f"    Dest MAC:      {format_mac(dest_addr)} {'(valid)' if dest_mac_valid else ''}")
-                print(f"    VLAN ID:       {vlan_id}")
+                print(f"    VLAN ID:       {vlan_id} {'(valid)' if vlan_valid else ''}")
                 print(f"    Class:         {'B' if class_b else 'A'}")
                 print(f"    Talker Failed: {talker_failed}")
                 print(f"    Streaming Wait:{streaming_wait}")
@@ -1399,6 +1476,52 @@ def _acmp_command(interface: str, talker_id_str: str, listener_id_str: str,
         sock.close()
 
 
+def cmd_clock_source(interface: str, entity_id_str: str,
+                     clock_domain_index: int = 0,
+                     clock_source_index: int = None) -> None:
+    """Get or set CLOCK_DOMAIN current CLOCK_SOURCE via AECP."""
+    mac = get_mac_address(interface)
+    controller_id = mac_to_entity_id(mac)
+    target_id = parse_entity_id(entity_id_str)
+
+    sock = open_raw_socket(interface)
+    try:
+        target_mac = _resolve_mac(sock, interface, mac, target_id)
+        seq_id = int(time.monotonic() * 1000) & 0xFFFF
+        op = "GET_CLOCK_SOURCE" if clock_source_index is None else "SET_CLOCK_SOURCE"
+        print(f"Interface:     {interface}")
+        print(f"Controller ID: {format_entity_id(controller_id)}")
+        print(f"Entity ID:     {entity_id_str}")
+        print(f"Entity MAC:    {format_mac(target_mac)}")
+        print(f"Command:       {op}")
+        print(f"Clock Domain:  {clock_domain_index}")
+        if clock_source_index is not None:
+            print(f"Clock Source:  {clock_source_index}")
+
+        resp = send_clock_source(sock, interface, mac, controller_id,
+                                 target_id, target_mac, seq_id,
+                                 clock_domain_index, clock_source_index)
+        if resp is None:
+            print(f"Timeout: no {op}_RESPONSE received within 3 seconds.")
+            sys.exit(1)
+        status_name = {0: "SUCCESS", 1: "NOT_IMPLEMENTED", 2: "NO_SUCH_DESCRIPTOR",
+                       3: "ENTITY_LOCKED", 4: "ENTITY_ACQUIRED",
+                       9: "NOT_SUPPORTED", 12: "ENTITY_MISBEHAVING",
+                       13: "NOT_AUTHENTICATED", 14: "AUTHENTICATION_DISABLED",
+                       15: "BAD_ARGUMENTS", 16: "NO_RESOURCES",
+                       17: "IN_PROGRESS", 18: "ENTITY_NOT_READY",
+                       19: "STREAM_IS_RUNNING"}.get(resp["status"], f"ERROR({resp['status']})")
+        print(f"\nReceived {op}_RESPONSE:")
+        print(f"  Status:              {status_name}")
+        print(f"  Descriptor Type:     0x{resp['descriptor_type']:04x}")
+        print(f"  Clock Domain Index:  {resp['descriptor_index']}")
+        print(f"  Clock Source Index:  {resp['clock_source_index']}")
+        if resp["status"] != 0:
+            sys.exit(1)
+    finally:
+        sock.close()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1459,6 +1582,15 @@ examples:
     sp_info = subparsers.add_parser("stream-info", help="Query stream info for an entity")
     sp_info.add_argument("entity_id", help="Entity ID to query (colon-separated hex)")
 
+    # clock-source
+    sp_clock = subparsers.add_parser(
+        "clock-source", help="Get or set an entity CLOCK_DOMAIN clock source")
+    sp_clock.add_argument("entity_id", help="Entity ID to query/control")
+    sp_clock.add_argument("--clock-domain", type=int, default=0,
+                          help="CLOCK_DOMAIN descriptor index (default 0)")
+    sp_clock.add_argument("--set", dest="clock_source", type=int, default=None,
+                          help="Set active CLOCK_SOURCE index; omit to get current source")
+
     # get-tx-state
     sp_gts = subparsers.add_parser("get-tx-state",
         help="Query ACMP GET_TX_STATE on a talker (shows connection_count)")
@@ -1492,6 +1624,10 @@ examples:
                        talker_uid=args.talker_uid, listener_uid=args.listener_uid)
     elif args.command == "stream-info":
         cmd_stream_info(args.interface, args.entity_id)
+    elif args.command == "clock-source":
+        cmd_clock_source(args.interface, args.entity_id,
+                         clock_domain_index=args.clock_domain,
+                         clock_source_index=args.clock_source)
     elif args.command == "get-tx-state":
         cmd_get_tx_state(args.interface, args.talker_id, args.talker_uid)
     elif args.command == "direct-disconnect-tx":

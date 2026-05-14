@@ -240,6 +240,7 @@ sudo python3 avb_controller.py connect <talker_entity_id> <listener_entity_id>
 | Option | Default | Description |
 |---|---|---|
 | `--format`, `-f` | *(none)* | Stream format to set on both endpoints before connecting. See [Stream formats](#stream-formats). |
+| `--match-supported`, `-m` | off | When set with `--format`, first read each endpoint's supported_formats list and pick the closest entry (scored on subtype, sample rate, channel count, bit depth) for each side independently. Use this when devices encode the same logical format with different bytes — most commonly the AAF byte-3 difference between PCM32 (Milan, byte 0x20) and PCM24 (byte 0x18). Without this flag, the literal preset bytes are sent and a strict-match firmware will reject anything that doesn't byte-equal an entry in its supported_formats. |
 | `--talker-uid` | `0` | Talker stream output index (`STREAM_OUTPUT[N]`). |
 | `--listener-uid` | `0` | Listener stream input index (`STREAM_INPUT[N]`). |
 

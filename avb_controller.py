@@ -72,13 +72,51 @@ AECP_CMD_SET_STREAM_FORMAT = 0x0008
 AECP_CMD_GET_STREAM_INFO = 0x000F
 AECP_CMD_SET_CLOCK_SOURCE = 0x0016
 AECP_CMD_GET_CLOCK_SOURCE = 0x0017
+AECP_CMD_SET_CONTROL = 0x0018
+AECP_CMD_GET_CONTROL = 0x0019
 
-# AEM descriptor types
+# AEM descriptor types (IEEE 1722.1-2021 Table 7-1)
 AEM_DESC_TYPE_ENTITY = 0x0000
+AEM_DESC_TYPE_CONFIGURATION = 0x0001
+AEM_DESC_TYPE_AUDIO_UNIT = 0x0002
 AEM_DESC_TYPE_STREAM_INPUT = 0x0005
 AEM_DESC_TYPE_STREAM_OUTPUT = 0x0006
 AEM_DESC_TYPE_STRINGS = 0x000D
+# NB: AEM_DESC_TYPE_CONTROL was historically 0x0009 in this tool;
+# the IEEE-1722.1 value for CONTROL is 0x001A and 0x0009 is
+# AVB_INTERFACE. Keeping 0x0009 here to match existing callers
+# until they are migrated.
+AEM_DESC_TYPE_CONTROL = 0x0009
+AEM_DESC_TYPE_AVB_INTERFACE = 0x0009  # alias
+AEM_DESC_TYPE_CLOCK_SOURCE = 0x000A
+AEM_DESC_TYPE_MEMORY_OBJECT = 0x000B
+AEM_DESC_TYPE_LOCALE = 0x000C
+AEM_DESC_TYPE_STREAM_PORT_INPUT = 0x000E
+AEM_DESC_TYPE_STREAM_PORT_OUTPUT = 0x000F
+AEM_DESC_TYPE_AUDIO_CLUSTER = 0x0014
+AEM_DESC_TYPE_AUDIO_MAP = 0x0017
 AEM_DESC_TYPE_CLOCK_DOMAIN = 0x0024
+
+# Name → type lookup for the read-descriptor CLI. Keep keys lowercase.
+AEM_DESC_TYPE_BY_NAME = {
+    "entity": AEM_DESC_TYPE_ENTITY,
+    "configuration": AEM_DESC_TYPE_CONFIGURATION,
+    "audio_unit": AEM_DESC_TYPE_AUDIO_UNIT,
+    "stream_input": AEM_DESC_TYPE_STREAM_INPUT,
+    "stream_output": AEM_DESC_TYPE_STREAM_OUTPUT,
+    "strings": AEM_DESC_TYPE_STRINGS,
+    "control": AEM_DESC_TYPE_CONTROL,
+    "avb_interface": AEM_DESC_TYPE_AVB_INTERFACE,
+    "clock_source": AEM_DESC_TYPE_CLOCK_SOURCE,
+    "memory_object": AEM_DESC_TYPE_MEMORY_OBJECT,
+    "locale": AEM_DESC_TYPE_LOCALE,
+    "stream_port_input": AEM_DESC_TYPE_STREAM_PORT_INPUT,
+    "stream_port_output": AEM_DESC_TYPE_STREAM_PORT_OUTPUT,
+    "audio_cluster": AEM_DESC_TYPE_AUDIO_CLUSTER,
+    "audio_map": AEM_DESC_TYPE_AUDIO_MAP,
+    "clock_domain": AEM_DESC_TYPE_CLOCK_DOMAIN,
+}
+AEM_DESC_NAME_BY_TYPE = {v: k for k, v in AEM_DESC_TYPE_BY_NAME.items()}
 
 # Well-known stream format presets (8 bytes each)
 # IEC 61883-6 AM824: subtype=0, vendor=0, format=0x10, sf=1, fdf_sfc, fdf_evt=0, dbs=8, ...
@@ -680,13 +718,91 @@ def send_set_stream_format(sock, interface: str, mac: bytes, controller_id: byte
             # Check it's a SET_STREAM_FORMAT response for our target
             if len(payload) >= 22 and payload[4:12] == target_id:
                 status = status_valtime
-                status_name = {0: "SUCCESS", 1: "NOT_IMPLEMENTED", 2: "NO_SUCH_DESCRIPTOR",
-                               9: "NOT_SUPPORTED", 12: "ENTITY_MISBEHAVING"}.get(status, f"ERROR({status})")
+                # Per IEEE 1722.1-2021 Table 9.1:
+                status_name = {0: "SUCCESS", 1: "NOT_IMPLEMENTED",
+                               2: "NO_SUCH_DESCRIPTOR", 3: "ENTITY_LOCKED",
+                               4: "ENTITY_ACQUIRED", 5: "NOT_AUTHENTICATED",
+                               6: "AUTHENTICATION_DISABLED", 7: "BAD_ARGUMENTS",
+                               8: "NO_RESOURCES", 9: "IN_PROGRESS",
+                               10: "ENTITY_MISBEHAVING", 11: "NOT_SUPPORTED",
+                               12: "STREAM_IS_RUNNING"}.get(status, f"ERROR({status})")
                 print(f"  SET_STREAM_FORMAT response from {format_entity_id(target_id)}: {status_name}")
                 return status == 0
 
     print(f"  SET_STREAM_FORMAT timeout for {format_entity_id(target_id)}")
     return False
+
+
+def query_supported_formats(sock, interface: str, mac: bytes,
+                            controller_id: bytes, target_id: bytes,
+                            target_mac: bytes, descriptor_type: int,
+                            descriptor_index: int, seq_id: int,
+                            timeout: float = 2.0) -> list:
+    """Send AECP READ_DESCRIPTOR for a stream descriptor and return its
+    supported_formats list (each entry is 8 bytes). Returns [] on timeout."""
+    msg = build_aecp_read_descriptor(controller_id, target_id, seq_id,
+                                     descriptor_type, descriptor_index)
+    send_frame(sock, interface, target_mac, mac, msg)
+
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        result = recv_frame(sock, timeout=0.2)
+        if result is None:
+            continue
+        _, payload = result
+        if len(payload) < 12 or payload[4:12] != target_id:
+            continue
+        resp = parse_aecp_read_descriptor_response(payload)
+        if resp is None:
+            continue
+        if resp.get("descriptor_type") != descriptor_type:
+            continue
+        if resp.get("descriptor_index") != descriptor_index:
+            continue
+        return resp.get("supported_formats", [])
+    return []
+
+
+def pick_closest_format(target: bytes, candidates: list) -> tuple:
+    """Score each candidate format against the target and return
+    (best_bytes, best_info, score). Score key (higher is better):
+        same subtype  : +1000
+        same SR       : +200, else −|ΔSR|/1000
+        same channels : +100, else −|Δch|*5
+        same bit_depth: +10,  else −|Δbd|
+
+    Returns (None, None, -inf) if candidates is empty."""
+    if not candidates:
+        return (None, None, float("-inf"))
+    targ = _extract_format_info(target) or {}
+    best = None
+    best_score = float("-inf")
+    best_info = None
+    for cand in candidates:
+        info = _extract_format_info(cand) or {}
+        score = 0.0
+        if info.get("base_format") and info["base_format"] == targ.get("base_format"):
+            score += 1000
+        if info.get("sample_rate") and targ.get("sample_rate"):
+            if info["sample_rate"] == targ["sample_rate"]:
+                score += 200
+            else:
+                score -= abs(info["sample_rate"] - targ["sample_rate"]) / 1000.0
+        if info.get("channels") and targ.get("channels"):
+            if info["channels"] == targ["channels"]:
+                score += 100
+            else:
+                score -= abs(info["channels"] - targ["channels"]) * 5
+        if info.get("bit_depth") and targ.get("bit_depth"):
+            if info["bit_depth"] == targ["bit_depth"]:
+                score += 10
+            else:
+                score -= abs(info["bit_depth"] - targ["bit_depth"])
+        if score > best_score:
+            best_score = score
+            best = cand
+            best_info = info
+    return (best, best_info, best_score)
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +882,95 @@ def send_clock_source(sock, interface: str, mac: bytes, controller_id: bytes,
     return None
 
 
+def _encode_control_value(control_index: int, value: int = None,
+                          value_type: str = None) -> bytes:
+    if value is None:
+        return b""
+    if value_type is None:
+        value_type = "uint8" if control_index == 0 else "int16"
+    if value_type == "uint8":
+        return struct.pack("!B", value & 0xFF)
+    if value_type == "int16":
+        return struct.pack("!h", value)
+    raise ValueError(f"unsupported control value type: {value_type}")
+
+
+def _decode_control_value(control_index: int, values: bytes):
+    if control_index == 0:
+        return values[0] if len(values) >= 1 else None
+    return struct.unpack("!h", values[:2])[0] if len(values) >= 2 else None
+
+
+def build_aecp_control(controller_id: bytes, target_id: bytes,
+                       seq_id: int, command_type: int, control_index: int,
+                       value: int = None, value_type: str = None) -> bytes:
+    """Build AECP GET_CONTROL or SET_CONTROL for CONTROL descriptor.
+
+    The ESP example uses CONTROL[0] IDENTIFY as a one-byte uint8 and
+    CONTROL[1]/[2] volume/gain as signed int16 tenths of dB.
+    """
+    values = _encode_control_value(control_index, value, value_type)
+    control_data_len = 18 + 2 + 4 + len(values)
+    header = encode_atdecc_header(AVTP_SUBTYPE_AECP, AECP_MSG_AEM_COMMAND,
+                                  0, 0, 0, control_data_len)
+    aem = encode_aecp_aem_header(command_type)
+    return (header
+            + target_id
+            + controller_id
+            + struct.pack("!H", seq_id)
+            + aem
+            + struct.pack("!HH", AEM_DESC_TYPE_CONTROL, control_index)
+            + values)
+
+
+def parse_aecp_control_response(payload: bytes) -> dict:
+    """Parse AECP GET_CONTROL or SET_CONTROL response."""
+    if len(payload) < 28:
+        return None
+    subtype, msg_type, sv, version, status_valtime, cdl = decode_atdecc_header(payload[:4])
+    if subtype != AVTP_SUBTYPE_AECP or msg_type != AECP_MSG_AEM_RESPONSE:
+        return None
+    command_type = (((payload[22] >> 2) & 0x3F) << 8) | payload[23]
+    if command_type not in (AECP_CMD_SET_CONTROL, AECP_CMD_GET_CONTROL):
+        return None
+    desc_type, desc_index = struct.unpack("!HH", payload[24:28])
+    return {
+        "target_id": payload[4:12],
+        "controller_id": payload[12:20],
+        "seq_id": struct.unpack("!H", payload[20:22])[0],
+        "status": status_valtime,
+        "command_type": command_type,
+        "descriptor_type": desc_type,
+        "descriptor_index": desc_index,
+        "values": payload[28:],
+    }
+
+
+def send_control(sock, interface: str, mac: bytes, controller_id: bytes,
+                 target_id: bytes, target_mac: bytes, seq_id: int,
+                 control_index: int, value: int = None,
+                 value_type: str = None) -> dict:
+    command_type = AECP_CMD_GET_CONTROL if value is None else AECP_CMD_SET_CONTROL
+    msg = build_aecp_control(controller_id, target_id, seq_id, command_type,
+                             control_index, value, value_type)
+    send_frame(sock, interface, target_mac, mac, msg)
+
+    start = time.monotonic()
+    while time.monotonic() - start < 3.0:
+        result = recv_frame(sock, timeout=0.2)
+        if result is None:
+            continue
+        src_mac_rx, payload = result
+        resp = parse_aecp_control_response(payload)
+        if (resp and resp["target_id"] == target_id and
+                resp["controller_id"] == controller_id and
+                resp["seq_id"] == seq_id and
+                resp["descriptor_index"] == control_index and
+                resp["command_type"] == command_type):
+            return resp
+    return None
+
+
 # ---------------------------------------------------------------------------
 # ACMP message building
 # ---------------------------------------------------------------------------
@@ -774,7 +979,7 @@ def build_acmp_message(msg_type: int, controller_id: bytes,
                        talker_id: bytes, listener_id: bytes,
                        talker_uid: int = 0, listener_uid: int = 0,
                        connection_count: int = 0, seq_id: int = 0,
-                       stream_id: bytes = None) -> bytes:
+                       stream_id: bytes = None, flags: int = 0) -> bytes:
     """Build an ACMP message.
 
     ACMP layout:
@@ -800,7 +1005,7 @@ def build_acmp_message(msg_type: int, controller_id: bytes,
            + b"\x00" * 6                        # stream_dest_addr (6)
            + struct.pack("!H", connection_count) # connection_count (2)
            + struct.pack("!H", seq_id)          # seq_id (2)
-           + struct.pack("!H", 0)               # flags (2)
+           + struct.pack("!H", flags)           # flags (2)
            + struct.pack("!H", 0)               # stream_vlan_id (2)
            + struct.pack("!H", 0))              # conn_listeners_entries (2)
 
@@ -1216,11 +1421,20 @@ def cmd_stream_info(interface: str, entity_id_str: str) -> None:
 
 def cmd_connect(interface: str, talker_id_str: str, listener_id_str: str,
                 format_name: str = None, talker_uid: int = 0,
-                listener_uid: int = 0) -> None:
+                listener_uid: int = 0, match_supported: bool = False,
+                class_b: bool = False) -> None:
     """Connect a talker to a listener via ACMP CONNECT_RX_COMMAND.
 
     If format_name is given, sets stream format on both talker (output) and
-    listener (input) before connecting.
+    listener (input) before connecting. With match_supported=True, query each
+    endpoint's supported_formats list first and pick the closest match — useful
+    when the desired format's exact byte encoding isn't in the device's list
+    (e.g. AAF PCM32 vs PCM24 byte-3 differences).
+
+    With class_b=True the ACMP flags field is sent with bit 15 (CLASS_B) set
+    per IEEE 1722.1-2021 §8.2.1.16 Table 8-4, selecting SR Class B
+    (priority 2, 250 µs observation interval) for this connection. Default
+    (False) requests Class A (priority 3, 125 µs).
     """
     if format_name:
         # Resolve aliases
@@ -1230,13 +1444,11 @@ def cmd_connect(interface: str, talker_id_str: str, listener_id_str: str,
             print(f"Unknown format '{format_name}'. Available: {avail}")
             sys.exit(1)
 
-        stream_format = STREAM_FORMATS[format_name]
+        requested_format = STREAM_FORMATS[format_name]
         mac = get_mac_address(interface)
         controller_id = mac_to_entity_id(mac)
         talker_id = parse_entity_id(talker_id_str)
         listener_id = parse_entity_id(listener_id_str)
-
-        print(f"Setting stream format to '{format_name}' on both endpoints...")
 
         sock = open_raw_socket(interface)
         seq_id = int(time.monotonic() * 1000) & 0xFFFF
@@ -1247,18 +1459,47 @@ def cmd_connect(interface: str, talker_id_str: str, listener_id_str: str,
         talker_mac = _resolve_mac(sock, interface, mac, talker_id, duration=2.0)
         listener_mac = _resolve_mac(sock, interface, mac, listener_id, duration=2.0)
 
+        talker_format = requested_format
+        listener_format = requested_format
+        if match_supported:
+            print(f"Querying supported formats (target: '{format_name}')...")
+            talker_supported = query_supported_formats(
+                sock, interface, mac, controller_id, talker_id, talker_mac,
+                AEM_DESC_TYPE_STREAM_OUTPUT, 0, seq_id)
+            seq_id += 1
+            listener_supported = query_supported_formats(
+                sock, interface, mac, controller_id, listener_id, listener_mac,
+                AEM_DESC_TYPE_STREAM_INPUT, 0, seq_id)
+            seq_id += 1
+            if not talker_supported:
+                print(f"  Warning: no supported_formats from talker; falling back to '{format_name}' bytes")
+            else:
+                picked, info, _ = pick_closest_format(requested_format, talker_supported)
+                talker_format = picked
+                print(f"  Talker pick:   {_format_stream_format(picked)} "
+                      f"({picked.hex()})")
+            if not listener_supported:
+                print(f"  Warning: no supported_formats from listener; falling back to '{format_name}' bytes")
+            else:
+                picked, info, _ = pick_closest_format(requested_format, listener_supported)
+                listener_format = picked
+                print(f"  Listener pick: {_format_stream_format(picked)} "
+                      f"({picked.hex()})")
+        else:
+            print(f"Setting stream format to '{format_name}' on both endpoints...")
+
         # Set format on talker output stream (descriptor_type=STREAM_OUTPUT, index=0)
         ok1 = send_set_stream_format(sock, interface, mac, controller_id,
                                       talker_id, talker_mac,
                                       AEM_DESC_TYPE_STREAM_OUTPUT, 0,
-                                      stream_format, seq_id)
+                                      talker_format, seq_id)
         seq_id += 1
 
         # Set format on listener input stream (descriptor_type=STREAM_INPUT, index=0)
         ok2 = send_set_stream_format(sock, interface, mac, controller_id,
                                       listener_id, listener_mac,
                                       AEM_DESC_TYPE_STREAM_INPUT, 0,
-                                      stream_format, seq_id + 1)
+                                      listener_format, seq_id + 1)
         sock.close()
 
         if not ok1:
@@ -1270,7 +1511,8 @@ def cmd_connect(interface: str, talker_id_str: str, listener_id_str: str,
     _acmp_command(interface, talker_id_str, listener_id_str,
                   ACMP_MSG_CONNECT_RX_COMMAND, "CONNECT_RX_COMMAND",
                   ACMP_MSG_CONNECT_RX_RESPONSE, "CONNECT_RX_RESPONSE",
-                  talker_uid=talker_uid, listener_uid=listener_uid)
+                  talker_uid=talker_uid, listener_uid=listener_uid,
+                  flags=(0x8000 if class_b else 0))
 
 
 def cmd_disconnect(interface: str, talker_id_str: str, listener_id_str: str,
@@ -1389,7 +1631,8 @@ def cmd_direct_disconnect_tx(interface: str, talker_id_str: str,
 def _acmp_command(interface: str, talker_id_str: str, listener_id_str: str,
                   cmd_type: int, cmd_name: str,
                   rsp_type: int, rsp_name: str,
-                  talker_uid: int = 0, listener_uid: int = 0) -> None:
+                  talker_uid: int = 0, listener_uid: int = 0,
+                  flags: int = 0) -> None:
     """Send an ACMP command and wait for a response."""
     mac = get_mac_address(interface)
     controller_id = mac_to_entity_id(mac)
@@ -1414,6 +1657,7 @@ def _acmp_command(interface: str, talker_id_str: str, listener_id_str: str,
         listener_uid=listener_uid,
         connection_count=1,
         seq_id=seq_id,
+        flags=flags,
     )
 
     send_frame(sock, interface, ACMP_MULTICAST, mac, msg)
@@ -1522,6 +1766,248 @@ def cmd_clock_source(interface: str, entity_id_str: str,
         sock.close()
 
 
+AECP_STATUS_NAMES = {0: "SUCCESS", 1: "NOT_IMPLEMENTED", 2: "NO_SUCH_DESCRIPTOR",
+                    3: "ENTITY_LOCKED", 4: "ENTITY_ACQUIRED",
+                    9: "NOT_SUPPORTED", 12: "ENTITY_MISBEHAVING",
+                    13: "NOT_AUTHENTICATED", 14: "AUTHENTICATION_DISABLED",
+                    15: "BAD_ARGUMENTS", 16: "NO_RESOURCES",
+                    17: "IN_PROGRESS", 18: "ENTITY_NOT_READY"}
+
+
+def _cmd_control(interface: str, entity_id_str: str, control_index: int,
+                 name: str, value: int = None, value_type: str = None) -> None:
+    mac = get_mac_address(interface)
+    controller_id = mac_to_entity_id(mac)
+    target_id = parse_entity_id(entity_id_str)
+
+    sock = open_raw_socket(interface)
+    try:
+        target_mac = _resolve_mac(sock, interface, mac, target_id)
+        seq_id = int(time.monotonic() * 1000) & 0xFFFF
+        op = "GET_CONTROL" if value is None else "SET_CONTROL"
+        print(f"Interface:     {interface}")
+        print(f"Controller ID: {format_entity_id(controller_id)}")
+        print(f"Entity ID:     {entity_id_str}")
+        print(f"Entity MAC:    {format_mac(target_mac)}")
+        print(f"Command:       {op} {name}")
+        if value is not None:
+            if control_index == 0:
+                print(f"Value:         {value}")
+            else:
+                print(f"Value:         {value / 10.0:.1f} dB ({value} tenths dB)")
+
+        resp = send_control(sock, interface, mac, controller_id,
+                            target_id, target_mac, seq_id,
+                            control_index=control_index, value=value,
+                            value_type=value_type)
+        if resp is None:
+            print(f"Timeout: no {op}_RESPONSE received within 3 seconds.")
+            sys.exit(1)
+        status_name = AECP_STATUS_NAMES.get(resp["status"], f"ERROR({resp['status']})")
+        echoed = _decode_control_value(control_index, resp["values"])
+        print(f"\nReceived {op}_RESPONSE:")
+        print(f"  Status:          {status_name}")
+        print(f"  Descriptor Type: 0x{resp['descriptor_type']:04x}")
+        print(f"  Control Index:   {resp['descriptor_index']}")
+        if control_index == 0:
+            print(f"  Value:           {echoed}")
+        else:
+            db = echoed / 10.0 if echoed is not None else None
+            print(f"  Value:           {db:.1f} dB ({echoed} tenths dB)" if echoed is not None
+                  else "  Value:           <missing>")
+        if resp["status"] != 0:
+            sys.exit(1)
+    finally:
+        sock.close()
+
+
+def cmd_identify(interface: str, entity_id_str: str, value: int = 1) -> None:
+    """Set CONTROL[0] IDENTIFY via AECP SET_CONTROL."""
+    _cmd_control(interface, entity_id_str, 0, "IDENTIFY", value, "uint8")
+
+
+def cmd_volume(interface: str, entity_id_str: str, value_tenth_db: int = None) -> None:
+    """Get or set CONTROL[1] Speaker Volume."""
+    _cmd_control(interface, entity_id_str, 1, "Speaker Volume", value_tenth_db, "int16")
+
+
+def cmd_mic_gain(interface: str, entity_id_str: str, value_tenth_db: int = None) -> None:
+    """Get or set CONTROL[2] Mic Gain."""
+    _cmd_control(interface, entity_id_str, 2, "Mic Gain", value_tenth_db, "int16")
+
+
+def _parse_descriptor_type(s: str) -> int:
+    """Accept either a name (e.g. 'configuration') or a numeric value
+    (decimal or 0x-prefixed hex)."""
+    sl = s.strip().lower()
+    if sl in AEM_DESC_TYPE_BY_NAME:
+        return AEM_DESC_TYPE_BY_NAME[sl]
+    try:
+        return int(s, 0) & 0xFFFF
+    except ValueError:
+        raise SystemExit(
+            f"unknown descriptor type '{s}'. "
+            f"Names: {', '.join(sorted(AEM_DESC_TYPE_BY_NAME))} "
+            f"— or pass a numeric value (decimal or 0x...).")
+
+
+def cmd_read_descriptor(interface: str, entity_id_str: str,
+                        descriptor: str, descriptor_index: int = 0,
+                        configuration_index: int = 0) -> None:
+    """Send AECP READ_DESCRIPTOR to an entity and dump the raw response.
+
+    Useful for diagnosing controller-reported model errors (e.g. Hive's
+    'a device is required to have at least one configuration descriptor')
+    by inspecting exactly what the entity returns. Prints both a hex dump
+    and a parsed summary for descriptor types this tool knows about
+    (Entity, Configuration, Stream Input/Output, Strings)."""
+    desc_type = _parse_descriptor_type(descriptor)
+    desc_name = AEM_DESC_NAME_BY_TYPE.get(desc_type, f"0x{desc_type:04x}")
+
+    mac = get_mac_address(interface)
+    controller_id = mac_to_entity_id(mac)
+    entity_id = parse_entity_id(entity_id_str)
+
+    print(f"Interface:         {interface}")
+    print(f"Entity ID:         {entity_id_str}")
+    print(f"Descriptor:        {desc_name} (0x{desc_type:04x})")
+    print(f"Descriptor index:  {descriptor_index}")
+    print(f"Config index:      {configuration_index}")
+
+    sock = open_raw_socket(interface)
+    entity_mac = _resolve_mac(sock, interface, mac, entity_id, duration=3.0)
+    print(f"Entity MAC:        {format_mac(entity_mac)}")
+
+    seq_id = int(time.monotonic() * 1000) & 0xFFFF
+    msg = build_aecp_read_descriptor(controller_id, entity_id, seq_id,
+                                     desc_type, descriptor_index)
+    # build_aecp_read_descriptor uses configuration_index=0 internally;
+    # patch in the requested config index (bytes 0..1 of the AEM body,
+    # which lives at offset 22 from start of msg per the encoder layout).
+    if configuration_index != 0:
+        msg = bytearray(msg)
+        struct.pack_into("!H", msg, 24, configuration_index)
+        msg = bytes(msg)
+    send_frame(sock, interface, entity_mac, mac, msg)
+
+    start = time.monotonic()
+    response = None
+    while time.monotonic() - start < 2.0:
+        result = recv_frame(sock, timeout=0.2)
+        if result is None:
+            continue
+        _, payload = result
+        if len(payload) < 22:
+            continue
+        subtype, msg_type, _, _, status, _ = decode_atdecc_header(payload[:4])
+        if subtype != AVTP_SUBTYPE_AECP or msg_type != AECP_MSG_AEM_RESPONSE:
+            continue
+        if payload[4:12] != entity_id:
+            continue
+        rseq = struct.unpack("!H", payload[20:22])[0]
+        if rseq != seq_id:
+            continue
+        response = payload
+        break
+
+    if response is None:
+        print("\nNo response (timeout).")
+        return
+
+    # status_valtime byte: low 5 bits are AECP status
+    aecp_status = (response[2] >> 3) & 0x1F
+    status_names = {
+        0: "SUCCESS", 1: "NOT_IMPLEMENTED", 2: "NO_SUCH_DESCRIPTOR",
+        3: "ENTITY_LOCKED", 4: "ENTITY_ACQUIRED", 5: "NOT_AUTHENTICATED",
+        6: "AUTHENTICATION_DISABLED", 7: "BAD_ARGUMENTS", 8: "NO_RESOURCES",
+        9: "IN_PROGRESS", 10: "ENTITY_MISBEHAVING", 11: "NOT_SUPPORTED",
+        12: "STREAM_IS_RUNNING",
+    }
+    status_str = status_names.get(aecp_status, f"status_{aecp_status}")
+    print(f"\nAECP status: {aecp_status} ({status_str})")
+    print(f"Response length: {len(response)} bytes")
+
+    # Hex dump
+    print("\nHex dump:")
+    for i in range(0, len(response), 16):
+        chunk = response[i:i + 16]
+        hexs = " ".join(f"{b:02x}" for b in chunk)
+        ascii_ = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        print(f"  {i:04x}  {hexs:<47s}  {ascii_}")
+
+    # Parsed summary for known descriptor types. The descriptor body
+    # starts at payload offset 32 (after AECP common, AEM header,
+    # config_index, reserved, descriptor_type, descriptor_index).
+    body = response[32:]
+    print("\nParsed:")
+    if desc_type == AEM_DESC_TYPE_ENTITY and len(body) >= 308:
+        # Entity descriptor layout (IEEE 1722.1-2021 §7.2.1):
+        #   entity_id(8) entity_model_id(8) entity_capabilities(4)
+        #   talker_stream_sources(2) talker_capabilities(2)
+        #   listener_stream_sinks(2) listener_capabilities(2)
+        #   controller_capabilities(4) available_index(4)
+        #   association_id(8) entity_name(64) vendor_name_string(2)
+        #   model_name_string(2) firmware_version(64) group_name(64)
+        #   serial_number(64) configurations_count(2)
+        #   current_configuration(2)
+        ent_id = body[0:8].hex(":")
+        model_id = body[8:16].hex(":")
+        cfgs = struct.unpack("!H", body[304:306])[0]
+        cur_cfg = struct.unpack("!H", body[306:308])[0]
+        ent_name = body[72:136].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        fw = body[140:204].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        print(f"  entity_id:             {ent_id}")
+        print(f"  entity_model_id:       {model_id}")
+        print(f"  entity_name:           {ent_name!r}")
+        print(f"  firmware_version:      {fw!r}")
+        print(f"  configurations_count:  {cfgs}")
+        print(f"  current_configuration: {cur_cfg}")
+        if cfgs == 0:
+            print("  *** WARNING: configurations_count == 0 — "
+                  "controllers will reject this entity ***")
+    elif desc_type == AEM_DESC_TYPE_CONFIGURATION and len(body) >= 70:
+        # Configuration descriptor layout (IEEE 1722.1-2021 §7.2.2):
+        #   object_name(64) localized_description(2)
+        #   descriptor_counts_count(2) descriptor_counts_offset(2)
+        #   descriptor_counts[N*4]
+        obj_name = body[0:64].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        loc = struct.unpack("!H", body[64:66])[0]
+        cc = struct.unpack("!H", body[66:68])[0]
+        co = struct.unpack("!H", body[68:70])[0]
+        print(f"  object_name:                {obj_name!r}")
+        print(f"  localized_description:      0x{loc:04x}")
+        print(f"  descriptor_counts_count:    {cc}")
+        print(f"  descriptor_counts_offset:   {co}")
+        # The counts array is at body offset (co - 4) — co is relative
+        # to the descriptor start (which includes the 4-byte
+        # descriptor_type+descriptor_index that lives just before
+        # the body in the response payload).
+        counts_off = co - 4
+        if counts_off >= 0 and counts_off + cc * 4 <= len(body):
+            print("  descriptor_counts:")
+            for i in range(cc):
+                off = counts_off + i * 4
+                dt = struct.unpack("!H", body[off:off + 2])[0]
+                cnt = struct.unpack("!H", body[off + 2:off + 4])[0]
+                dt_name = AEM_DESC_NAME_BY_TYPE.get(dt, f"0x{dt:04x}")
+                print(f"    [{i}] descriptor_type=0x{dt:04x} "
+                      f"({dt_name}) count={cnt}")
+        if cc == 0:
+            print("  *** WARNING: descriptor_counts_count == 0 — "
+                  "configuration is empty ***")
+    else:
+        parsed = parse_aecp_read_descriptor_response(response)
+        if parsed:
+            for k, v in parsed.items():
+                if isinstance(v, (bytes, bytearray)):
+                    print(f"  {k}: {bytes(v).hex(':')}")
+                else:
+                    print(f"  {k}: {v}")
+        else:
+            print("  (no specific parser for this descriptor type — "
+                  "use the hex dump above)")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1560,10 +2046,20 @@ examples:
     sp_connect = subparsers.add_parser("connect", help="Connect a talker to a listener")
     sp_connect.add_argument("talker_entity_id", help="Talker entity ID (colon-separated hex)")
     sp_connect.add_argument("listener_entity_id", help="Listener entity ID (colon-separated hex)")
+    sp_connect.add_argument("--match-supported", "-m", action="store_true",
+                           help="Read each endpoint's supported_formats list and pick "
+                                "the closest match to --format (subtype/SR/channels/bit-depth). "
+                                "Use when the requested byte encoding may not match the device "
+                                "exactly (e.g. AAF PCM32 vs PCM24 byte-3 = 32 vs 24).")
     sp_connect.add_argument("--format", "-f", default=None,
                            help="Stream format to set on both endpoints before connecting. "
                                 "Options: am824-48k, am824-44.1k, am824-96k, aaf-48k, aaf-44.1k, aaf-96k, "
                                 "am824 (alias for am824-48k), aaf (alias for aaf-48k), 61883 (alias for am824-48k)")
+    sp_connect.add_argument("--class-b", "-b", action="store_true",
+                           help="Set ACMP CLASS_B flag (bit 15) so the talker "
+                                "configures this connection as SR Class B "
+                                "(priority 2, 250 us observation interval). "
+                                "Default = Class A (priority 3, 125 us).")
     sp_connect.add_argument("--talker-uid", type=int, default=0,
                             help="Talker stream output index (default 0)")
     sp_connect.add_argument("--listener-uid", type=int, default=0,
@@ -1591,6 +2087,27 @@ examples:
     sp_clock.add_argument("--set", dest="clock_source", type=int, default=None,
                           help="Set active CLOCK_SOURCE index; omit to get current source")
 
+    # identify
+    sp_identify = subparsers.add_parser(
+        "identify", help="Trigger an entity's CONTROL[0] IDENTIFY control")
+    sp_identify.add_argument("entity_id", help="Entity ID to identify")
+    sp_identify.add_argument("--value", type=int, default=1,
+                             help="IDENTIFY value to set (default 1)")
+
+    # volume
+    sp_volume = subparsers.add_parser(
+        "volume", help="Get or set CONTROL[1] Speaker Volume")
+    sp_volume.add_argument("entity_id", help="Entity ID to query/control")
+    sp_volume.add_argument("--set-db", type=float, default=None,
+                           help="Set speaker volume in dB; omit to get current value")
+
+    # mic-gain
+    sp_mic = subparsers.add_parser(
+        "mic-gain", help="Get or set CONTROL[2] Mic Gain")
+    sp_mic.add_argument("entity_id", help="Entity ID to query/control")
+    sp_mic.add_argument("--set-db", type=float, default=None,
+                        help="Set mic gain in dB; omit to get current value")
+
     # get-tx-state
     sp_gts = subparsers.add_parser("get-tx-state",
         help="Query ACMP GET_TX_STATE on a talker (shows connection_count)")
@@ -1605,6 +2122,22 @@ examples:
     sp_ddt.add_argument("talker_uid", type=int, help="Talker stream output index")
     sp_ddt.add_argument("listener_uid", type=int, help="Listener stream input index")
 
+    # read-descriptor
+    sp_rd = subparsers.add_parser(
+        "read-descriptor",
+        help="Send AECP READ_DESCRIPTOR and dump the response (hex + parse)")
+    sp_rd.add_argument("entity_id", help="Target entity ID (colon-separated hex)")
+    sp_rd.add_argument(
+        "descriptor",
+        help="Descriptor type — name (e.g. 'configuration', 'entity', "
+             "'stream_input') or numeric (decimal or 0x-prefixed hex)")
+    sp_rd.add_argument(
+        "--index", type=int, default=0,
+        help="descriptor_index (default 0)")
+    sp_rd.add_argument(
+        "--config-index", type=int, default=0,
+        help="configuration_index field on the command (default 0)")
+
     args = parser.parse_args()
 
     # Check we are running as root
@@ -1618,7 +2151,9 @@ examples:
     elif args.command == "connect":
         cmd_connect(args.interface, args.talker_entity_id, args.listener_entity_id,
                     format_name=args.format,
-                    talker_uid=args.talker_uid, listener_uid=args.listener_uid)
+                    talker_uid=args.talker_uid, listener_uid=args.listener_uid,
+                    match_supported=args.match_supported,
+                    class_b=args.class_b)
     elif args.command == "disconnect":
         cmd_disconnect(args.interface, args.talker_entity_id, args.listener_entity_id,
                        talker_uid=args.talker_uid, listener_uid=args.listener_uid)
@@ -1628,12 +2163,24 @@ examples:
         cmd_clock_source(args.interface, args.entity_id,
                          clock_domain_index=args.clock_domain,
                          clock_source_index=args.clock_source)
+    elif args.command == "identify":
+        cmd_identify(args.interface, args.entity_id, value=args.value)
+    elif args.command == "volume":
+        value = None if args.set_db is None else int(round(args.set_db * 10.0))
+        cmd_volume(args.interface, args.entity_id, value_tenth_db=value)
+    elif args.command == "mic-gain":
+        value = None if args.set_db is None else int(round(args.set_db * 10.0))
+        cmd_mic_gain(args.interface, args.entity_id, value_tenth_db=value)
     elif args.command == "get-tx-state":
         cmd_get_tx_state(args.interface, args.talker_id, args.talker_uid)
     elif args.command == "direct-disconnect-tx":
         cmd_direct_disconnect_tx(args.interface, args.talker_id,
                                  args.listener_id, args.talker_uid,
                                  args.listener_uid)
+    elif args.command == "read-descriptor":
+        cmd_read_descriptor(args.interface, args.entity_id, args.descriptor,
+                            descriptor_index=args.index,
+                            configuration_index=args.config_index)
 
 
 if __name__ == "__main__":

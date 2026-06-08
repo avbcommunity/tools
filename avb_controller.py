@@ -74,6 +74,7 @@ AECP_CMD_SET_CLOCK_SOURCE = 0x0016
 AECP_CMD_GET_CLOCK_SOURCE = 0x0017
 AECP_CMD_SET_CONTROL = 0x0018
 AECP_CMD_GET_CONTROL = 0x0019
+AECP_CMD_GET_AVB_INFO = 0x0027
 
 # AEM descriptor types (IEEE 1722.1-2021 Table 7-1)
 AEM_DESC_TYPE_ENTITY = 0x0000
@@ -442,6 +443,9 @@ def parse_adp_entity(payload: bytes) -> dict:
         "roles": ", ".join(roles) if roles else "None",
         "available_index": available_index,
         "valid_time": valid_time,
+        "gptp_gm_id": body[36:44],
+        "gptp_gm_id_str": format_entity_id(body[36:44]),
+        "gptp_domain": body[44],
     }
 
 
@@ -1266,6 +1270,20 @@ def cmd_discover(interface: str, duration: float = 5.0, show_streams: bool = Fal
         print(f"{eid_str:<26} {info['entity_name'][:20]:<20} {info['model_id_str']:<26} "
               f"{info['roles']:<22} {info['src_mac']:<18} {streams_str}")
 
+    # gPTP grandmaster (BTC) each entity is locked to (advertised in ADP)
+    print(f"\ngPTP grandmaster (BTC) each entity is locked to:")
+    by_gm = {}
+    for eid_str, info in entities.items():
+        gm = info.get("gptp_gm_id_str", "?")
+        by_gm.setdefault(gm, []).append(
+            (info.get("entity_name") or eid_str, eid_str,
+             info.get("gptp_domain", "?")))
+    for gm in sorted(by_gm):
+        members = by_gm[gm]
+        print(f"  BTC {gm} (domain {members[0][2]}):")
+        for name, eid, _ in sorted(members):
+            print(f"      {name} [{eid}]")
+
     # Print stream descriptors per entity
     if entity_streams and show_streams:
         print("\n--- Stream Descriptors ---")
@@ -1851,6 +1869,109 @@ def _parse_descriptor_type(s: str) -> int:
             f"— or pass a numeric value (decimal or 0x...).")
 
 
+def build_aecp_get_avb_info(controller_id: bytes, target_id: bytes,
+                            seq_id: int, descriptor_index: int = 0) -> bytes:
+    """Build an AECP GET_AVB_INFO command for an AVB_INTERFACE descriptor."""
+    # body after the 4-byte header: target(8)+controller(8)+seq(2)+aem(2)
+    #   + descriptor_type(2) + descriptor_index(2) = 24
+    control_data_len = 24
+    header = encode_atdecc_header(AVTP_SUBTYPE_AECP, AECP_MSG_AEM_COMMAND,
+                                  0, 0, 0, control_data_len)
+    aem = encode_aecp_aem_header(AECP_CMD_GET_AVB_INFO)
+    return (header
+            + target_id
+            + controller_id
+            + struct.pack("!H", seq_id)
+            + aem
+            + struct.pack("!HH", AEM_DESC_TYPE_AVB_INTERFACE, descriptor_index))
+
+
+def cmd_get_avb_info(interface: str, entity_id_str: str,
+                     descriptor_index: int = 0) -> None:
+    """Query an entity's gPTP/SRP state for an AVB_INTERFACE via AECP
+    GET_AVB_INFO: the grandmaster (BTC) it is locked to, gPTP domain,
+    AS_CAPABLE, gPTP/SRP enabled, and the measured propagation delay.
+
+    Unlike READ_DESCRIPTOR(AVB_INTERFACE) — which returns the interface's
+    OWN clock identity — GET_AVB_INFO reports the runtime gPTP state, i.e.
+    which BTC this device is actually synchronized to."""
+    mac = get_mac_address(interface)
+    controller_id = mac_to_entity_id(mac)
+    entity_id = parse_entity_id(entity_id_str)
+
+    print(f"Interface:         {interface}")
+    print(f"Entity ID:         {entity_id_str}")
+    print(f"AVB interface idx: {descriptor_index}")
+
+    sock = open_raw_socket(interface)
+    entity_mac = _resolve_mac(sock, interface, mac, entity_id, duration=3.0)
+    print(f"Entity MAC:        {format_mac(entity_mac)}")
+
+    seq_id = int(time.monotonic() * 1000) & 0xFFFF
+    msg = build_aecp_get_avb_info(controller_id, entity_id, seq_id,
+                                  descriptor_index)
+    send_frame(sock, interface, entity_mac, mac, msg)
+
+    start = time.monotonic()
+    response = None
+    while time.monotonic() - start < 2.0:
+        result = recv_frame(sock, timeout=0.2)
+        if result is None:
+            continue
+        _, payload = result
+        if len(payload) < 24:
+            continue
+        subtype, msg_type, _, _, _, _ = decode_atdecc_header(payload[:4])
+        if subtype != AVTP_SUBTYPE_AECP or msg_type != AECP_MSG_AEM_RESPONSE:
+            continue
+        if payload[4:12] != entity_id:
+            continue
+        cmd_type = (((payload[22] >> 2) & 0x3F) << 8) | payload[23]
+        if cmd_type != AECP_CMD_GET_AVB_INFO:
+            continue
+        if struct.unpack("!H", payload[20:22])[0] != seq_id:
+            continue
+        response = payload
+        break
+
+    if response is None:
+        print("\nNo response (timeout).")
+        return
+
+    aecp_status = (response[2] >> 3) & 0x1F
+    if aecp_status != 0:
+        names = {1: "NOT_IMPLEMENTED", 2: "NO_SUCH_DESCRIPTOR",
+                 11: "NOT_SUPPORTED"}
+        print(f"\nAECP status: {aecp_status} "
+              f"({names.get(aecp_status, 'not SUCCESS')}) — entity may not "
+              f"implement GET_AVB_INFO; the ADP-advertised grandmaster from "
+              f"'discover' is the fallback.")
+        return
+
+    # Command-specific data starts at offset 24 (after AEM command_type):
+    #   descriptor_type(2) descriptor_index(2) gptp_grandmaster_id(8)
+    #   propagation_delay(4) gptp_domain_number(1) flags(1)
+    #   msrp_mappings_count(2) ...
+    if len(response) < 44:
+        print(f"\nResponse too short ({len(response)} bytes).")
+        return
+    gm = response[28:36]
+    propagation_delay = struct.unpack("!I", response[36:40])[0]
+    domain = response[40]
+    flags = response[41]
+    msrp_count = struct.unpack("!H", response[42:44])[0]
+    # AVB_INFO flags (IEEE 1722.1): bit0 AS_CAPABLE, bit1 GPTP_ENABLED,
+    # bit2 SRP_ENABLED. Raw byte printed too for sanity-checking.
+    print(f"\ngPTP grandmaster (BTC): {format_entity_id(gm)}")
+    print(f"gPTP domain:            {domain}")
+    print(f"AS_CAPABLE:             {bool(flags & 0x01)}")
+    print(f"gPTP enabled:           {bool(flags & 0x02)}")
+    print(f"SRP enabled:            {bool(flags & 0x04)}")
+    print(f"propagation delay:      {propagation_delay} ns")
+    print(f"MSRP mappings:          {msrp_count}")
+    print(f"(raw flags: 0x{flags:02x})")
+
+
 def cmd_read_descriptor(interface: str, entity_id_str: str,
                         descriptor: str, descriptor_index: int = 0,
                         configuration_index: int = 0) -> None:
@@ -2009,6 +2130,113 @@ def cmd_read_descriptor(interface: str, entity_id_str: str,
 
 
 # ---------------------------------------------------------------------------
+# Descriptor harvest with per-request timing
+# ---------------------------------------------------------------------------
+
+# Well-known AEM descriptor types worth probing on a single endpoint
+HARVEST_DEFAULT_TYPES = [
+    ("entity",             AEM_DESC_TYPE_ENTITY),
+    ("configuration",      AEM_DESC_TYPE_CONFIGURATION),
+    ("audio_unit",         AEM_DESC_TYPE_AUDIO_UNIT),
+    ("stream_input",       AEM_DESC_TYPE_STREAM_INPUT),
+    ("stream_output",      AEM_DESC_TYPE_STREAM_OUTPUT),
+    ("avb_interface",      AEM_DESC_TYPE_AVB_INTERFACE),
+    ("clock_source",       AEM_DESC_TYPE_CLOCK_SOURCE),
+    ("locale",             AEM_DESC_TYPE_LOCALE),
+    ("strings",            AEM_DESC_TYPE_STRINGS),
+    ("stream_port_input",  AEM_DESC_TYPE_STREAM_PORT_INPUT),
+    ("stream_port_output", AEM_DESC_TYPE_STREAM_PORT_OUTPUT),
+    ("audio_cluster",      AEM_DESC_TYPE_AUDIO_CLUSTER),
+    ("audio_map",          AEM_DESC_TYPE_AUDIO_MAP),
+    ("clock_domain",       AEM_DESC_TYPE_CLOCK_DOMAIN),
+]
+
+
+def cmd_harvest(interface: str, entity_id_str: str, descriptor_index: int = 0,
+                timeout: float = 2.0, repeat: int = 1) -> None:
+    """Send READ_DESCRIPTOR for each well-known descriptor type and time the
+    response RTT. Useful for benchmarking AECP responsiveness end-to-end
+    (e.g. wired vs Wi-Fi-bridged endpoints) and verifying which descriptors
+    an entity actually implements."""
+    mac = get_mac_address(interface)
+    controller_id = mac_to_entity_id(mac)
+    entity_id = parse_entity_id(entity_id_str)
+
+    print(f"Interface:     {interface}")
+    print(f"Entity ID:     {entity_id_str}")
+    sock = open_raw_socket(interface)
+    try:
+        entity_mac = _resolve_mac(sock, interface, mac, entity_id, duration=3.0)
+        print(f"Entity MAC:    {format_mac(entity_mac)}")
+        print(f"Index:         {descriptor_index}   Repeat: {repeat}   "
+              f"Timeout: {timeout:.1f}s")
+        print()
+        print(f"{'descriptor':<22} {'status':<10} {'rtt_ms':>10}  {'resp_bytes':>10}")
+        print("-" * 60)
+        all_rtts = []
+        ok_count = 0
+        timeout_count = 0
+        seq = int(time.monotonic() * 1000) & 0xFFFF
+        for name, type_code in HARVEST_DEFAULT_TYPES:
+            for rep in range(repeat):
+                seq = (seq + 1) & 0xFFFF
+                # Drain any stale frames before timing
+                while recv_frame(sock, timeout=0.0) is not None:
+                    pass
+                msg = build_aecp_read_descriptor(
+                    controller_id, entity_id, seq, type_code, descriptor_index)
+                t0 = time.monotonic()
+                send_frame(sock, interface, entity_mac, mac, msg)
+                resp_status = None
+                resp_len = 0
+                rtt_ms = None
+                while time.monotonic() - t0 < timeout:
+                    r = recv_frame(sock, timeout=0.05)
+                    if r is None:
+                        continue
+                    _, payload = r
+                    if len(payload) < 22:
+                        continue
+                    subtype, mtype, _, _, st, _ = decode_atdecc_header(payload[:4])
+                    if subtype != AVTP_SUBTYPE_AECP or mtype != AECP_MSG_AEM_RESPONSE:
+                        continue
+                    if payload[4:12] != entity_id:
+                        continue
+                    rseq = struct.unpack("!H", payload[20:22])[0]
+                    if rseq != seq:
+                        continue
+                    rtt_ms = (time.monotonic() - t0) * 1000.0
+                    resp_status = st
+                    resp_len = len(payload)
+                    break
+                if rtt_ms is None:
+                    timeout_count += 1
+                    status_str = "TIMEOUT"
+                    rtt_str = "--"
+                else:
+                    if resp_status == 0:
+                        ok_count += 1
+                    status_name = {0: "SUCCESS", 1: "NOT_IMPL",
+                                   2: "NO_DESC", 11: "NOT_SUPP"}.get(
+                        resp_status, f"st={resp_status}")
+                    status_str = status_name
+                    rtt_str = f"{rtt_ms:.2f}"
+                    all_rtts.append(rtt_ms)
+                tag = name if repeat == 1 else f"{name}#{rep}"
+                print(f"{tag:<22} {status_str:<10} {rtt_str:>10}  {resp_len:>10}")
+        print()
+        total = len(HARVEST_DEFAULT_TYPES) * repeat
+        print(f"Summary: {ok_count}/{total} SUCCESS, {timeout_count} timeouts")
+        if all_rtts:
+            mn, mx = min(all_rtts), max(all_rtts)
+            avg = sum(all_rtts) / len(all_rtts)
+            print(f"RTT (ms): min={mn:.2f}  avg={avg:.2f}  max={mx:.2f}  "
+                  f"(over {len(all_rtts)} responses)")
+    finally:
+        sock.close()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -2138,6 +2366,27 @@ examples:
         "--config-index", type=int, default=0,
         help="configuration_index field on the command (default 0)")
 
+    # avb-info
+    sp_ai = subparsers.add_parser(
+        "avb-info",
+        help="Query gPTP/SRP state via GET_AVB_INFO (grandmaster/BTC, domain, "
+             "AS_CAPABLE, propagation delay)")
+    sp_ai.add_argument("entity_id", help="Target entity ID (colon-separated hex)")
+    sp_ai.add_argument("--index", type=int, default=0,
+                       help="AVB_INTERFACE descriptor_index (default 0)")
+
+    # harvest
+    sp_hv = subparsers.add_parser(
+        "harvest",
+        help="Read each well-known descriptor type and report per-request RTT")
+    sp_hv.add_argument("entity_id", help="Target entity ID (colon-separated hex)")
+    sp_hv.add_argument("--index", type=int, default=0,
+                       help="descriptor_index for each request (default 0)")
+    sp_hv.add_argument("--timeout", type=float, default=2.0,
+                       help="per-request response timeout in seconds (default 2.0)")
+    sp_hv.add_argument("--repeat", type=int, default=1,
+                       help="number of times to query each descriptor (default 1)")
+
     args = parser.parse_args()
 
     # Check we are running as root
@@ -2181,6 +2430,13 @@ examples:
         cmd_read_descriptor(args.interface, args.entity_id, args.descriptor,
                             descriptor_index=args.index,
                             configuration_index=args.config_index)
+    elif args.command == "avb-info":
+        cmd_get_avb_info(args.interface, args.entity_id,
+                         descriptor_index=args.index)
+    elif args.command == "harvest":
+        cmd_harvest(args.interface, args.entity_id,
+                    descriptor_index=args.index,
+                    timeout=args.timeout, repeat=args.repeat)
 
 
 if __name__ == "__main__":

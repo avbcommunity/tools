@@ -100,7 +100,7 @@ The tool outputs a report containing:
 
 - **ADP** -- AVDECC Discovery Protocol. Listens for periodic `ENTITY_AVAILABLE` advertisements to find devices.
 - **ACMP** -- AVDECC Connection Management Protocol. Establishes and tears down stream connections between talkers and listeners.
-- **AECP** -- AVDECC Enumeration and Control Protocol. Reads descriptors (entity name, stream descriptors, supported formats) and changes stream formats.
+- **AECP** -- AVDECC Enumeration and Control Protocol. Reads descriptors (entity name, stream descriptors, supported formats), benchmarks descriptor RTT, changes stream formats, drives controls (identify / volume / mic gain / clock source), and queries runtime gPTP state (`GET_AVB_INFO`).
 
 The controller acts as a transient ATDECC controller entity for the duration of a single command. Its own entity ID is derived from the local interface MAC (EUI-64). It does not maintain state between invocations.
 
@@ -148,11 +148,17 @@ sudo python3 avb_controller.py [--interface IFACE] <command> [args]
 |---|---|
 | `discover` | List entities advertising on the network; optionally summarize their streams. |
 | `stream-info` | Query live stream state (format, dest MAC, MSRP failure, latency) for one entity. |
-| `connect` | Tell a listener to subscribe to a talker's stream (optionally setting format first). |
+| `connect` | Tell a listener to subscribe to a talker's stream (optionally setting format / SR class first). |
 | `disconnect` | Tell a listener to unsubscribe from a talker's stream. |
 | `get-tx-state` | Ask a talker how many listeners are currently connected to one of its outputs. |
 | `clock-source` | Get or set an entity CLOCK_DOMAIN active CLOCK_SOURCE index. |
+| `identify` | Trigger an entity's CONTROL[0] IDENTIFY (e.g. blink an LED). |
+| `volume` | Get or set CONTROL[1] Speaker Volume (dB). |
+| `mic-gain` | Get or set CONTROL[2] Mic Gain (dB). |
 | `direct-disconnect-tx` | Send a `DISCONNECT_TX_COMMAND` straight to a talker (diagnostic / state-machine probe). |
+| `read-descriptor` | Send AECP `READ_DESCRIPTOR` and dump the raw + parsed response. |
+| `avb-info` | Query runtime gPTP/SRP state via `GET_AVB_INFO` (grandmaster/BTC, AS_CAPABLE, propagation delay). |
+| `harvest` | Read every well-known descriptor type and report per-request RTT. |
 
 ---
 
@@ -244,7 +250,7 @@ Sends ACMP `CONNECT_RX_COMMAND` to the listener (via the well-known ACMP multica
 
 ```
 sudo python3 avb_controller.py connect <talker_entity_id> <listener_entity_id>
-                                       [--format FMT]
+                                       [--format FMT] [--match-supported] [--class-b]
                                        [--talker-uid N] [--listener-uid N]
 ```
 
@@ -257,6 +263,7 @@ sudo python3 avb_controller.py connect <talker_entity_id> <listener_entity_id>
 |---|---|---|
 | `--format`, `-f` | *(none)* | Stream format to set on both endpoints before connecting. See [Stream formats](#stream-formats). |
 | `--match-supported`, `-m` | off | When set with `--format`, first read each endpoint's supported_formats list and pick the closest entry (scored on subtype, sample rate, channel count, bit depth) for each side independently. Use this when devices encode the same logical format with different bytes — most commonly the AAF byte-3 difference between PCM32 (Milan, byte 0x20) and PCM24 (byte 0x18). Without this flag, the literal preset bytes are sent and a strict-match firmware will reject anything that doesn't byte-equal an entry in its supported_formats. |
+| `--class-b`, `-b` | off (Class A) | Set the ACMP `CLASS_B` flag (bit 15) so the talker configures this connection as SR Class B (priority 2, 250 us observation interval). Default is Class A (priority 3, 125 us). |
 | `--talker-uid` | `0` | Talker stream output index (`STREAM_OUTPUT[N]`). |
 | `--listener-uid` | `0` | Listener stream input index (`STREAM_INPUT[N]`). |
 
@@ -350,6 +357,87 @@ CRF/media-clock streams can be connected with the normal `connect` command by se
 
 ---
 
+#### `identify`
+
+Sends AECP `SET_CONTROL` to the entity's `CONTROL[0]` IDENTIFY control -- the standard way to make a device physically announce itself (e.g. blink an LED). The value is a one-byte `uint8`: `1` starts identifying, `0` clears it.
+
+```
+sudo python3 avb_controller.py identify <entity_id> [--value N]
+```
+
+| Argument | Description |
+|---|---|
+| `entity_id` | Entity ID to identify. |
+
+| Option | Default | Description |
+|---|---|---|
+| `--value` | `1` | IDENTIFY value to write (`1` = on, `0` = off). |
+
+**Examples:**
+
+```bash
+sudo python3 avb_controller.py identify 00:1b:21:ff:fe:01:02:03
+sudo python3 avb_controller.py identify 00:1b:21:ff:fe:01:02:03 --value 0
+```
+
+---
+
+#### `volume`
+
+Gets or sets the entity's `CONTROL[1]` Speaker Volume. With no `--set-db`, sends `GET_CONTROL` and prints the current value; with `--set-db`, sends `SET_CONTROL`. The value is a signed int16 in tenths of a dB, so `--set-db` is given in dB and rounded to the nearest 0.1 dB on the wire.
+
+```
+sudo python3 avb_controller.py volume <entity_id> [--set-db DB]
+```
+
+| Argument | Description |
+|---|---|
+| `entity_id` | Entity ID to query/control. |
+
+| Option | Default | Description |
+|---|---|---|
+| `--set-db` | *(none = get)* | Speaker volume in dB. Omit to read the current value. |
+
+**Examples:**
+
+```bash
+# Read current speaker volume
+sudo python3 avb_controller.py volume 00:1b:21:ff:fe:01:02:03
+
+# Set speaker volume to -6 dB
+sudo python3 avb_controller.py volume 00:1b:21:ff:fe:01:02:03 --set-db -6
+```
+
+---
+
+#### `mic-gain`
+
+Gets or sets the entity's `CONTROL[2]` Mic Gain, using the same get/set semantics and tenths-of-a-dB int16 encoding as [`volume`](#volume).
+
+```
+sudo python3 avb_controller.py mic-gain <entity_id> [--set-db DB]
+```
+
+| Argument | Description |
+|---|---|
+| `entity_id` | Entity ID to query/control. |
+
+| Option | Default | Description |
+|---|---|---|
+| `--set-db` | *(none = get)* | Mic gain in dB. Omit to read the current value. |
+
+**Examples:**
+
+```bash
+# Read current mic gain
+sudo python3 avb_controller.py mic-gain 00:1b:21:ff:fe:01:02:03
+
+# Set mic gain to +12 dB
+sudo python3 avb_controller.py mic-gain 00:1b:21:ff:fe:01:02:03 --set-db 12
+```
+
+---
+
 #### `direct-disconnect-tx`
 
 Sends ACMP `DISCONNECT_TX_COMMAND` straight to a talker, bypassing the normal listener-driven flow. This is a diagnostic tool for probing how a talker's ACMP state machine reacts to an explicit disconnect (or for clearing stuck listener registrations on misbehaving talkers). Most networks should use `disconnect` instead.
@@ -370,6 +458,109 @@ sudo python3 avb_controller.py direct-disconnect-tx <talker_id> <listener_id> <t
 ```bash
 sudo python3 avb_controller.py direct-disconnect-tx \
     00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06 0 0
+```
+
+---
+
+#### `read-descriptor`
+
+Sends a single AECP `READ_DESCRIPTOR` and dumps the response as both a hex dump and a parsed summary. Handy for diagnosing controller-reported model errors (e.g. Hive complaining about a missing or malformed descriptor) by inspecting exactly what the entity returns. Parsing is implemented for the common types (Entity, Configuration, Stream Input/Output, Strings); others are shown as hex only.
+
+The `descriptor` argument accepts either a known name or a numeric type (decimal or `0x`-prefixed hex). Known names:
+
+`entity`, `configuration`, `audio_unit`, `stream_input`, `stream_output`, `strings`, `control`, `avb_interface`, `clock_source`, `memory_object`, `locale`, `stream_port_input`, `stream_port_output`, `audio_cluster`, `audio_map`, `clock_domain`.
+
+```
+sudo python3 avb_controller.py read-descriptor <entity_id> <descriptor> [--index N] [--config-index N]
+```
+
+| Argument | Description |
+|---|---|
+| `entity_id` | Target entity ID. |
+| `descriptor` | Descriptor type -- a known name or a numeric type (e.g. `entity`, `strings`, `0x0007`). |
+
+| Option | Default | Description |
+|---|---|---|
+| `--index` | `0` | `descriptor_index` to read. |
+| `--config-index` | `0` | `configuration_index` field on the command. |
+
+**Examples:**
+
+```bash
+# Dump the entity descriptor (name, model id, firmware, config count)
+sudo python3 avb_controller.py read-descriptor 00:1b:21:ff:fe:01:02:03 entity
+
+# Read STRINGS descriptor #1
+sudo python3 avb_controller.py read-descriptor 00:1b:21:ff:fe:01:02:03 strings --index 1
+```
+
+---
+
+#### `avb-info`
+
+Sends AECP `GET_AVB_INFO` for an `AVB_INTERFACE` descriptor and prints the entity's *runtime* gPTP/SRP state. Unlike `read-descriptor avb_interface` -- which returns the interface's own clock identity -- `GET_AVB_INFO` reports which grandmaster (BTC) the device is actually synchronized to, along with its domain, capability flags, and measured propagation delay.
+
+```
+sudo python3 avb_controller.py avb-info <entity_id> [--index N]
+```
+
+| Argument | Description |
+|---|---|
+| `entity_id` | Target entity ID. |
+
+| Option | Default | Description |
+|---|---|---|
+| `--index` | `0` | `AVB_INTERFACE` descriptor index. |
+
+**Fields shown:**
+
+| Field | Meaning |
+|---|---|
+| `gPTP grandmaster (BTC)` | Clock identity of the grandmaster this interface is locked to. |
+| `gPTP domain` | gPTP domain number. |
+| `AS_CAPABLE` | Link partner is 802.1AS-capable (flag bit 0). |
+| `gPTP enabled` | gPTP running on this interface (flag bit 1). |
+| `SRP enabled` | Stream Reservation Protocol enabled (flag bit 2). |
+| `propagation delay` | Measured peer delay (Pdelay) in nanoseconds. |
+| `MSRP mappings` | Number of MSRP priority mappings reported. |
+
+If the entity does not implement `GET_AVB_INFO`, the command prints the AECP status and points you to the ADP-advertised grandmaster from `discover` as a fallback.
+
+**Example:**
+
+```bash
+sudo python3 avb_controller.py avb-info 00:1b:21:ff:fe:01:02:03
+```
+
+---
+
+#### `harvest`
+
+Sends `READ_DESCRIPTOR` for each well-known descriptor type in turn and times the response round-trip. Useful for benchmarking AECP responsiveness end-to-end (e.g. a wired endpoint vs one reached through a Wi-Fi bridge) and for seeing at a glance which descriptors an entity actually implements.
+
+```
+sudo python3 avb_controller.py harvest <entity_id> [--index N] [--timeout SECONDS] [--repeat N]
+```
+
+| Argument | Description |
+|---|---|
+| `entity_id` | Target entity ID. |
+
+| Option | Default | Description |
+|---|---|---|
+| `--index` | `0` | `descriptor_index` used for every request. |
+| `--timeout` | `2.0` | Per-request response timeout in seconds. |
+| `--repeat` | `1` | Number of times to query each descriptor (for averaging RTT). |
+
+Descriptors probed: entity, configuration, audio_unit, stream_input, stream_output, avb_interface, clock_source, locale, strings, stream_port_input, stream_port_output, audio_cluster, audio_map, clock_domain.
+
+Output is a per-descriptor table (`descriptor`, `status`, `rtt_ms`, `resp_bytes`) followed by a summary line with the SUCCESS count, timeout count, and min/avg/max RTT.
+
+**Example:**
+
+```bash
+# Time every descriptor, three samples each
+sudo python3 avb_controller.py harvest 00:1b:21:ff:fe:01:02:03 --repeat 3
 ```
 
 ---

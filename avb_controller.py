@@ -2075,11 +2075,19 @@ def cmd_read_descriptor(interface: str, entity_id_str: str,
         model_id = body[8:16].hex(":")
         cfgs = struct.unpack("!H", body[304:306])[0]
         cur_cfg = struct.unpack("!H", body[306:308])[0]
-        ent_name = body[72:136].split(b"\x00", 1)[0].decode("utf-8", "replace")
-        fw = body[140:204].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        # entity_name follows the 44-byte fixed prefix (id, model_id,
+        # capabilities, stream counts, controller_caps, available_index,
+        # association_id), then the two localized name string refs, then
+        # firmware_version — consistent with configurations_count at 304.
+        ent_name = body[44:108].split(b"\x00", 1)[0].decode("utf-8", "replace")
+        vendor_ref = struct.unpack("!H", body[108:110])[0]
+        model_ref = struct.unpack("!H", body[110:112])[0]
+        fw = body[112:176].split(b"\x00", 1)[0].decode("utf-8", "replace")
         print(f"  entity_id:             {ent_id}")
         print(f"  entity_model_id:       {model_id}")
         print(f"  entity_name:           {ent_name!r}")
+        print(f"  vendor_name_string:    {vendor_ref}")
+        print(f"  model_name_string:     {model_ref}")
         print(f"  firmware_version:      {fw!r}")
         print(f"  configurations_count:  {cfgs}")
         print(f"  current_configuration: {cur_cfg}")

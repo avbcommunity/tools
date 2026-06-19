@@ -1,6 +1,6 @@
 # tools
 
-Community tools for testing AVB (Audio Video Bridging) networks. Includes a packet capture audio analyzer and an ATDECC network controller.
+Community tools for testing AVB (Audio Video Bridging) networks. Includes a packet capture audio analyzer, an ATDECC network controller, an MSRP/MVRP test applicant, and an AVTP PCM stream generator.
 
 ## Scripts
 
@@ -19,6 +19,22 @@ ATDECC (IEEE 1722.1-2021) controller for managing AVB stream connections on a lo
 Uses raw AF_PACKET sockets with ethertype 0x22F0 (AVTP/ATDECC). Requires root privileges or `CAP_NET_RAW` capability.
 
 **Dependencies:** Python 3 (standard library only). Linux only (uses `AF_PACKET` sockets).
+
+### `mrp_applicant.py`
+
+MSRP/MVRP test applicant. Acts as an MRP applicant for MSRP (IEEE 802.1Qat) and MVRP (IEEE 802.1ak): declares Talker, Listener, Domain, and VLAN attributes to a connected switch, decodes incoming MRPDUs, and prints a per-run summary with pass/fail expectations. Useful for verifying that a bridge has SR class / MSRP configured correctly and that VLAN registration is working before bringing up real streams.
+
+Uses raw AF_PACKET sockets with ethertypes 0x22EA (MSRP) and 0x88F5 (MVRP). Requires root privileges or `CAP_NET_RAW`.
+
+**Dependencies:** Python 3 (standard library only). Linux only.
+
+### `avtp_streamer.py`
+
+AVTP PCM stream generator. Synthesizes a continuous sine wave and transmits it as an AAF or IEC 61883-6 AM824 AVTP stream paced at the SR class A (8000 pps) or class B (4000 pps) rate. The stream carries N total channels; the first M are filled with PCM and the remaining N-M carry silence. Configurable destination MAC, StreamID, sample rate, bit depth, frequency, amplitude, duration, and optional 802.1Q tag. Useful for driving a listener under test or exercising MSRP reservations end-to-end without needing real audio source hardware.
+
+Uses raw AF_PACKET sockets with ethertype 0x22F0 (AVTP). Requires root privileges or `CAP_NET_RAW`.
+
+**Dependencies:** Python 3 (standard library only). Linux only.
 
 ---
 
@@ -426,3 +442,297 @@ Entity IDs are 8 bytes represented as colon-separated hex (e.g., `00:1b:21:ff:fe
 
 - IEEE 1722-2016 (AVTP) -- Section 7 (AAF), Section 9 (IEC 61883)
 - IEEE 1722.1-2021 (ATDECC) -- ADP, ACMP, AECP
+
+---
+
+## mrp_applicant.py
+
+### Overview
+
+`mrp_applicant.py` is a stateless MRP applicant for the two protocols built on the Multiple Registration Protocol:
+
+- **MVRP** (IEEE 802.1ak) -- declares VLAN registrations on EtherType `0x88F5` / multicast `01:80:c2:00:00:21`.
+- **MSRP** (IEEE 802.1Qat) -- declares Talker, Listener, and Domain attributes on EtherType `0x22EA` / multicast `01:80:c2:00:00:0e`.
+
+It encodes the standard MRPDU format (ProtocolVersion, Messages, VectorAttributes with ThreePackedEvents, plus FourPackedEvents for Listener declarations), periodically retransmits its JoinIn while the run is active, decodes any MRPDUs the bridge or peers send back, and finishes with a pass/fail summary describing which expectations were met.
+
+### Permissions
+
+Same as the controller -- raw `AF_PACKET` requires root or `CAP_NET_RAW`:
+
+```bash
+sudo python3 mrp_applicant.py -i eno1 monitor
+# or
+sudo setcap cap_net_raw+ep $(readlink -f $(which python3))
+```
+
+### Usage
+
+```
+sudo python3 mrp_applicant.py [--interface IFACE] [-v] <command> [args]
+```
+
+### Global Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--interface`, `-i` | `eno1` | Network interface to use. |
+| `--verbose`, `-v` | off | Print every decoded MRPDU as it arrives (otherwise only the run summary is printed). |
+
+### Commands at a glance
+
+| Command | Purpose |
+|---|---|
+| `monitor` | Passively decode MSRP+MVRP frames, then print a summary. |
+| `mvrp` | Register a VLAN ID with MVRP and check whether the bridge responds. |
+| `talker` | Advertise an MSRP Talker (StreamID + TSpec) and report any TalkerFailed code or Listener replies. |
+| `listener` | Declare an MSRP Listener (Ready / AskingFailed / ReadyFailed) and report any matching Talker attribute. |
+| `domain` | Declare an MSRP Domain (SR class, priority, VID) and report responses. |
+
+---
+
+#### `monitor`
+
+Listens for MSRP and MVRP traffic for `--duration` seconds and prints a summary of every VID, stream, and SR-class domain seen.
+
+```
+sudo python3 mrp_applicant.py [-v] monitor [--duration SECONDS]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--duration` | `10.0` | Listen duration in seconds. |
+
+---
+
+#### `mvrp`
+
+Sends MVRP `JoinIn` for a VLAN ID and (by default) periodically retransmits while listening for the bridge's response. On exit, sends a `Lv` for the same VID unless `--no-leave` is passed.
+
+```
+sudo python3 mrp_applicant.py mvrp <vid> [--duration SECONDS] [--join-interval SECONDS] [--no-leave]
+```
+
+| Argument | Description |
+|---|---|
+| `vid` | VLAN ID to register (1..4094). |
+
+| Option | Default | Description |
+|---|---|---|
+| `--duration` | `5.0` | Run duration in seconds. |
+| `--join-interval` | `1.0` | Seconds between repeat `JoinIn` declarations. |
+| `--no-leave` | off | Don't emit a `Lv` frame on exit. |
+
+The summary reports a `PASS` if any of `New`, `JoinIn`, `In`, or `JoinMt` events for the VID were observed -- a healthy switch will reflect the registration back so neighboring ports see it as `In`.
+
+---
+
+#### `talker`
+
+Advertises an MSRP Talker for a specific StreamID. Repeats the advertisement on `--join-interval` until `--duration` elapses, then sends a `Lv`.
+
+```
+sudo python3 mrp_applicant.py talker <stream_id> [options]
+```
+
+| Argument | Description |
+|---|---|
+| `stream_id` | 8-byte StreamID as colon-hex (e.g. `00:1b:21:01:02:03:00:01`). |
+
+| Option | Default | Description |
+|---|---|---|
+| `--dest-mac` | `91:e0:f0:00:fe:00` | Stream destination MAC carried in the TSpec. |
+| `--max-frame-size` | `1500` | TSpec MaxFrameSize in bytes. |
+| `--max-interval-frames` | `1` | TSpec MaxIntervalFrames per class interval. |
+| `--rank` | `1` | Rank: `0`=emergency, `1`=non-emergency. |
+| `--accumulated-latency` | `0` | Initial accumulated latency in ns. |
+| `--send-domain` | off | Also send a Domain declaration before the advertisement. |
+| `--sr-class` | `A` | SR class A (PCP 3, VID 2) or B (PCP 2, VID 2). |
+| `--pcp` | from class | Override 802.1Q PCP. |
+| `--vid` | from class | Override stream VLAN ID. |
+| `--duration` | `5.0` | Run duration in seconds. |
+| `--join-interval` | `1.0` | Seconds between repeat declarations. |
+| `--no-leave` | off | Don't emit a `Lv` frame on exit. |
+
+The summary reports three expectations:
+
+- `TalkerAdvertise not rejected by bridge` -- fails if any `TalkerFailed` is observed for this StreamID; the failure code is decoded (e.g. "Insufficient bandwidth", "VLAN tagging is disabled").
+- `Stream registered at the bridge` -- expects the bridge to propagate the advertisement back as `JoinIn`/`In`.
+- `Listener declared Ready` -- expects any peer to respond with a `Ready` Listener attribute (passes only if a Listener is actually subscribing).
+
+---
+
+#### `listener`
+
+Declares an MSRP Listener for a specific StreamID with a chosen declaration type (`Ready`, `AskingFailed`, `ReadyFailed`, or `Ignore`).
+
+```
+sudo python3 mrp_applicant.py listener <stream_id> [--declaration ready|asking_failed|ready_failed|ignore] [options]
+```
+
+| Argument | Description |
+|---|---|
+| `stream_id` | 8-byte StreamID as colon-hex. |
+
+| Option | Default | Description |
+|---|---|---|
+| `--declaration` | `ready` | Listener declaration type. |
+| `--send-domain` | off | Also send a Domain declaration before subscribing. |
+| `--sr-class`, `--pcp`, `--vid` | (see `talker`) | Class / priority / VID overrides. |
+| `--duration`, `--join-interval`, `--no-leave` | (see `talker`) | Pacing and teardown. |
+
+The summary reports whether a corresponding Talker attribute was observed for the StreamID; if `TalkerFailed` is reported, the failure code is decoded.
+
+---
+
+#### `domain`
+
+Declares an MSRP Domain (SR class ID + priority + VID).
+
+```
+sudo python3 mrp_applicant.py domain [--sr-class A|B] [--sr-class-id N] [--pcp N] [--vid N] [options]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--sr-class` | `A` | SR class for default ID / priority / VID. |
+| `--sr-class-id` | from class | Override SR class ID (default A=6, B=5). |
+| `--pcp` | from class | Override priority (A=3, B=2). |
+| `--vid` | from class | Override VID (default 2). |
+| `--duration`, `--join-interval`, `--no-leave` | (see `talker`) | Pacing and teardown. |
+
+The summary verifies that the bridge or a peer echoes back a matching Domain declaration (same SR class ID, priority, and VID).
+
+---
+
+### Example: bring up an MSRP stream reservation
+
+```bash
+# 1. Watch the wire for two seconds with no other applicant active.
+sudo python3 mrp_applicant.py -i eno1 monitor --duration 2
+
+# 2. Register VLAN 2 on the local port via MVRP.
+sudo python3 mrp_applicant.py -i eno1 mvrp 2 --duration 3
+
+# 3. Declare an SR class A Domain.
+sudo python3 mrp_applicant.py -i eno1 domain --sr-class A --duration 3
+
+# 4. Pretend to be a Talker. If the bridge has MSRP off, expect a TalkerFailed.
+sudo python3 mrp_applicant.py -i eno1 talker 00:1b:21:01:02:03:00:01 \
+    --max-frame-size 200 --max-interval-frames 1 --duration 5
+```
+
+### Troubleshooting
+
+- **No MRPDUs received in `monitor`** -- the port is not on an MRP-aware bridge, or it is treating these as reserved/control frames and forwarding them only to other bridges. Confirm the link partner is a switch with MSRP/MVRP enabled.
+- **`TalkerFailed code=1 (Insufficient bandwidth)`** -- the bridge does not have enough idle slope on the egress port for the requested TSpec. Lower `--max-frame-size` / `--max-interval-frames` or increase the configured SR-class slope.
+- **`TalkerFailed code=18 (VLAN tagging is disabled)`** -- the bridge requires SR-class frames to be VLAN tagged on this port. Most MSRP implementations need a VLAN configured for the SR class; ensure the stream's VID is allowed on this port.
+- **`Listener declared Ready` fails even when streams exist** -- no actual listener is registered downstream. The Talker test alone exercises only the Talker leg; pair with a real listener (or run `mrp_applicant.py listener ...` on a second host) to drive that expectation.
+
+---
+
+## avtp_streamer.py
+
+### Overview
+
+`avtp_streamer.py` synthesizes a sine wave and transmits it as an AVTP audio stream. It builds correct headers for either AAF (IEEE 1722-2016 §7) or IEC 61883-6 AM824 (§9), interleaves PCM samples across N channels, and paces packets at the SR class A (8000 pps) or class B (4000 pps) rate. The first M channels carry the sine wave; the remaining N-M channels carry silence -- useful for testing channel routing and rendering on listeners without needing real audio source hardware.
+
+This is a generator-only tool -- it does not negotiate MSRP or ATDECC. Use `mrp_applicant.py` or `avb_controller.py` to set up reservation / connection state first if your target listener needs them.
+
+### Permissions
+
+Raw `AF_PACKET` requires root or `CAP_NET_RAW`:
+
+```bash
+sudo python3 avtp_streamer.py -i eno1 --stream-id 00:1b:21:01:02:03:00:01 ...
+```
+
+### Usage
+
+```
+sudo python3 avtp_streamer.py [--interface IFACE] --stream-id <ID> [options]
+```
+
+### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--interface`, `-i` | `eno1` | Network interface for transmission. |
+| `--format` | `aaf` | `aaf` or `am824`. |
+| `--stream-id` | *(required)* | 8-byte StreamID (colon-hex or 16 hex chars). |
+| `--dest-mac` | `91:e0:f0:00:fe:00` | Destination MAC for the AVTP frames. |
+| `--freq` | `1000` | Sine wave frequency in Hz. |
+| `--duration` | `5.0` | Stream duration in seconds. |
+| `--amplitude` | `0.5` | Amplitude as a 0..1 fraction of full scale. |
+| `--sample-rate` | `48000` | Audio sample rate in Hz (8k/16k/32k/44.1k/48k/88.2k/96k/176.4k/192k for AAF; 32k–192k for AM824). |
+| `--bit-depth` | `24` | AAF bit depth (`16`, `24`, or `32`). AM824 is always 24-bit. |
+| `--channels` | `8` | Total channels per frame (N). |
+| `--active-channels` | `2` | First M channels filled with sine; channels [M..N) carry silence. |
+| `--sr-class` | `A` | `A` (8000 pps) or `B` (4000 pps). |
+| `--vlan` | *(none)* | If set, prepend an 802.1Q tag with this VID. |
+| `--pcp` | from class | 802.1Q priority (used only when `--vlan` is set). Defaults: A=3, B=2. |
+| `--presentation-offset` | `2.0` | Milliseconds added to `avtp_timestamp` (uses `CLOCK_TAI` when available). |
+
+### Examples
+
+```bash
+# 1 kHz sine on the first two of eight channels, AAF 48 kHz/24-bit, 5 seconds.
+sudo python3 avtp_streamer.py -i eno1 \
+    --stream-id 00:1b:21:01:02:03:00:01 \
+    --freq 1000 --duration 5 \
+    --channels 8 --active-channels 2
+
+# AM824 (IEC 61883-6) at 440 Hz, two-channel stereo, tagged on VLAN 2.
+sudo python3 avtp_streamer.py -i eno1 \
+    --format am824 \
+    --stream-id 00:1b:21:01:02:03:00:02 \
+    --freq 440 --duration 30 \
+    --channels 2 --active-channels 2 \
+    --vlan 2
+
+# Full-scale 96 kHz / 32-bit AAF on a known multicast destination MAC.
+sudo python3 avtp_streamer.py -i eno1 \
+    --stream-id aa:bb:cc:dd:ee:ff:00:01 \
+    --sample-rate 96000 --bit-depth 32 \
+    --amplitude 1.0 --freq 5000 \
+    --dest-mac 91:e0:f0:00:fe:10 --duration 60
+```
+
+### Progress and summary
+
+While streaming, the tool prints a one-line progress update each second showing packets sent, samples sent vs. target, and the current measured bit rate. On exit it prints a summary including measured pps, measured sample rate, and total bytes -- handy for confirming that the host is meeting the configured SR-class cadence:
+
+```
+Streaming summary
+================================================================
+  Packets sent:   40000
+  Samples sent:   240000 (target 240000)
+  Bytes sent:     11200000
+  Elapsed:        5.001s
+  Actual pps:     7998.2 (target 8000)
+  Actual sample rate: 47989.4 Hz (target 48000)
+  Actual bit rate: 17.92 Mbit/s
+```
+
+Exits non-zero (`2`) if it could not deliver at least 99.9% of the requested samples in the requested wall-clock time (typically a sign the host is overloaded or pacing is being throttled).
+
+### Pairing with the analyzer
+
+`avtp_streamer.py` emits frames in the exact layout `avb_audio_analyzer.py` parses, so a Wireshark capture of a stream produced by this tool can be fed straight into the analyzer:
+
+```bash
+# In one terminal, stream for 30 s.
+sudo python3 avtp_streamer.py -i eno1 \
+    --stream-id 00:1b:21:01:02:03:00:01 --freq 1000 --duration 30
+
+# In another, capture and analyze.
+sudo tshark -i eno1 -f 'ether proto 0x22f0' -a duration:30 -w stream.pcap
+python3 avb_audio_analyzer.py stream.pcap --wav out.wav
+```
+
+### Troubleshooting
+
+- **Listener hears clicks or dropouts** -- check the "Actual pps / Actual sample rate" lines on the summary. If they're significantly below target, the host can't keep up with the SR-class cadence; try a lower channel count, switch to SR class B (`--sr-class B`), or reduce `--sample-rate`.
+- **No audio at the listener even though packets are flowing** -- the listener may need an explicit ACMP connection (`avb_controller.py connect ...`) or an MSRP reservation (`mrp_applicant.py talker ...`) before it accepts the stream. Streaming raw AVTP onto the wire is not enough for compliant listeners.
+- **Listener mutes the inactive channels** -- intended behavior; channels `[--active-channels..--channels)` carry exact zeros. Increase `--active-channels` if you want signal on more channels.
+- **`unsupported sample rate` error** -- AAF and AM824 only encode a fixed set of rates; see the `--sample-rate` row above.

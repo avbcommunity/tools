@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-gPTP snoop — live inspector for IEEE 802.1AS traffic (ethertype 0x88F7)
-on a macOS interface, with direction tagging.
+gPTP inspector — live decoder for IEEE 802.1AS traffic (ethertype
+0x88F7) with direction tagging. Cross-platform: detects macOS and
+captures via BPF (bpf_shim.py, same directory); everywhere else it
+uses an AF_PACKET socket. Requires root (or CAP_NET_RAW on Linux).
 
-Captures via BPF (bpf_shim.py must sit in the same directory) with
-own-transmission visibility enabled, so frames this machine SENDS are
-captured too — the default view is exactly those outbound frames, which
-is the part no remote capture can attribute cleanly. Requires root
-(/dev/bpf).
+Direction is tagged by source MAC, and the capture path sees this
+machine's own transmissions on both platforms — with the macOS caveat
+that Apple generates gPTP inside IOgPTPPlugin.kext below every packet
+tap, so a Mac's own 802.1AS TX is invisible here by design (use
+gptp_monitor_macos.py for that side); inbound and third-party frames
+decode fine.
 
 Per-packet lines show direction, message type, sequence, source port
 identity and the interesting body fields (Announce: BTC priority vector;
@@ -28,9 +31,57 @@ import struct
 import sys
 import time
 
-from bpf_shim import MacBpfSocket, get_mac_address, recv_raw_ts
-
 ETH_P_PTP = 0x88F7
+
+if sys.platform == "darwin":
+    from bpf_shim import MacBpfSocket as RawPtpSocket
+    from bpf_shim import get_mac_address, recv_raw_ts
+else:
+    import fcntl
+    import select
+    import socket
+
+    def get_mac_address(interface):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            info = fcntl.ioctl(s.fileno(), 0x8927,  # SIOCGIFHWADDR
+                               struct.pack("256s", interface.encode()[:15]))
+            return info[18:24]
+        finally:
+            s.close()
+
+    class RawPtpSocket:
+        """AF_PACKET capture bound to the gPTP ethertype. Joins the
+        802.1AS link-local multicast group so NIC filtering can't hide
+        peer traffic; outgoing frames are delivered by the kernel on
+        packet sockets, so direction tagging works the same way."""
+
+        def __init__(self, interface, ethertype=ETH_P_PTP):
+            self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW,
+                                      socket.htons(ethertype))
+            self.sock.bind((interface, ethertype))
+            ifindex = socket.if_nametoindex(interface)
+            SOL_PACKET, PACKET_ADD_MEMBERSHIP, PACKET_MR_MULTICAST = 263, 1, 0
+            mreq = struct.pack("IHH8s", ifindex, PACKET_MR_MULTICAST, 6,
+                               b"\x01\x80\xc2\x00\x00\x0e\x00\x00")
+            self.sock.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, mreq)
+            self.sock.setblocking(False)
+
+        def close(self):
+            self.sock.close()
+
+    def recv_raw_ts(sock, timeout=0.1):
+        ready, _, _ = select.select([sock.sock], [], [], timeout)
+        if not ready:
+            return None
+        try:
+            data = sock.sock.recv(2048)
+        except BlockingIOError:
+            return None
+        if len(data) < 14:
+            return None
+        return (time.time(), data[0:6], data[6:12],
+                struct.unpack("!H", data[12:14])[0], data[14:])
 
 MSG_NAMES = {
     0x0: "Sync",
@@ -195,14 +246,14 @@ def main():
     args = ap.parse_args()
 
     my_mac = get_mac_address(args.interface)
-    sock = MacBpfSocket(args.interface, ethertype=ETH_P_PTP)
+    sock = RawPtpSocket(args.interface, ethertype=ETH_P_PTP)
     stats = Stats()
     wanted = set(t.lower() for t in args.type) if args.type else None
 
     stop = []
     signal.signal(signal.SIGINT, lambda *a: stop.append(1))
 
-    print(f"gPTP snoop on {args.interface} (mac {fmt_id(my_mac)}), "
+    print(f"gPTP inspector on {args.interface} (mac {fmt_id(my_mac)}), "
           f"direction={args.direction}", flush=True)
 
     deadline = time.time() + args.duration if args.duration else None

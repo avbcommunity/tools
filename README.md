@@ -38,14 +38,17 @@ Uses raw AF_PACKET sockets with ethertype 0x22F0 (AVTP). Requires root privilege
 
 ### `gptp_inspector.py`
 
-Live decoder for gPTP (IEEE 802.1AS, ethertype 0x88F7) frames on a macOS
-interface, using the same BPF backend as the controller. Shows per-packet
-message type, sequence, source port identity and body fields (Announce
-priority vector, Follow_Up origin timestamp + correction, Pdelay requesting
-port), with per-type rate summaries. **Sees inbound frames only on AVB-capable
-Macs** — see the note under `gptp_monitor_macos.py` for why, and for the outbound view.
+Live decoder for gPTP (IEEE 802.1AS, ethertype 0x88F7) frames with direction
+tagging. Shows per-packet message type, sequence, source port identity and
+body fields (Announce priority vector, Follow_Up origin timestamp +
+correction, Pdelay requesting port), with per-type rate summaries.
+Cross-platform: detects macOS and captures via BPF (`bpf_shim.py`);
+elsewhere it uses an AF_PACKET socket. **On AVB-capable Macs it sees inbound
+frames only** — see the note under `gptp_monitor_macos.py` for why, and for
+the outbound view.
 
-**Dependencies:** Python 3, `bpf_shim.py`, root. macOS only.
+**Dependencies:** Python 3 (plus `bpf_shim.py` on macOS), root or
+`CAP_NET_RAW`. Linux and macOS.
 
 ### `gptp_monitor_macos.py`
 

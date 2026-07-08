@@ -11,10 +11,10 @@ Protocol references:
   - IEEE 1722-2016 (AVTP) Section 7 (AAF) and Section 9 (IEC 61883)
 
 Usage:
-  python3 avb_audio_analyzer.py capture.pcap
-  python3 avb_audio_analyzer.py capture.pcap --wav output.wav
-  python3 avb_audio_analyzer.py capture.pcap --src-mac 00:11:22:33:44:55
-  python3 avb_audio_analyzer.py capture.pcap --channel 1
+  python3 avtp_audio_analyzer.py capture.pcap
+  python3 avtp_audio_analyzer.py capture.pcap --wav output.wav
+  python3 avtp_audio_analyzer.py capture.pcap --src-mac 00:11:22:33:44:55
+  python3 avtp_audio_analyzer.py capture.pcap --channel 1
 """
 
 import argparse

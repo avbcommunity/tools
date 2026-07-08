@@ -10,10 +10,10 @@ Protocol references:
   - IEEE 1722.1-2021 (ATDECC: ADP, ACMP, AECP)
 
 Usage:
-  sudo python3 avb_controller.py discover
-  sudo python3 avb_controller.py connect <talker_entity_id> <listener_entity_id>
-  sudo python3 avb_controller.py disconnect <talker_entity_id> <listener_entity_id>
-  sudo python3 avb_controller.py --interface eno1 discover
+  sudo python3 atdecc_controller.py discover
+  sudo python3 atdecc_controller.py connect <talker_entity_id> <listener_entity_id>
+  sudo python3 atdecc_controller.py disconnect <talker_entity_id> <listener_entity_id>
+  sudo python3 atdecc_controller.py --interface eno1 discover
 """
 
 import argparse
@@ -2254,10 +2254,10 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
-  sudo python3 avb_controller.py discover
-  sudo python3 avb_controller.py connect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06
-  sudo python3 avb_controller.py disconnect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06
-  sudo python3 avb_controller.py --interface eno1 discover
+  sudo python3 atdecc_controller.py discover
+  sudo python3 atdecc_controller.py connect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06
+  sudo python3 atdecc_controller.py disconnect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06
+  sudo python3 atdecc_controller.py --interface eno1 discover
 """,
     )
     parser.add_argument(
@@ -2401,7 +2401,7 @@ examples:
     if os.geteuid() != 0:
         print("Warning: this tool requires root privileges for raw socket access.",
               file=sys.stderr)
-        print("Run with: sudo python3 avb_controller.py ...", file=sys.stderr)
+        print("Run with: sudo python3 atdecc_controller.py ...", file=sys.stderr)
 
     if args.command == "discover":
         cmd_discover(args.interface, args.duration, show_streams=args.streams)

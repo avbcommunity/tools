@@ -4,7 +4,7 @@ Community tools for testing AVB (Audio Video Bridging) networks. Includes a pack
 
 ## Scripts
 
-### `avb_audio_analyzer.py`
+### `avtp_audio_analyzer.py`
 
 Extracts and analyzes PCM audio from AVTP (IEEE 1722-2016) packet captures. Reads pcap/pcapng files containing AVTP audio streams in AAF PCM or IEC 61883-6 AM824 format, extracts raw PCM samples, optionally writes a WAV file, and performs signal analysis including glitch detection, silence gap detection, periodic artifact detection, SNR, and THD.
 
@@ -12,7 +12,7 @@ Supports both numpy-accelerated analysis (FFT, SNR, THD, phase continuity) and a
 
 **Dependencies:** Python 3. Optional: `numpy` (for full FFT/SNR/THD/phase analysis), `scipy` (for Hilbert-transform phase analysis). Requires `editcap` (from Wireshark) for pcapng input files.
 
-### `avb_controller.py`
+### `atdecc_controller.py`
 
 ATDECC (IEEE 1722.1-2021) controller for managing AVB stream connections on a local network. Discovers AVB entities via ADP, connects and disconnects talkers and listeners via ACMP, queries stream info via AECP, and can set stream formats before connecting.
 
@@ -38,12 +38,12 @@ Uses raw AF_PACKET sockets with ethertype 0x22F0 (AVTP). Requires root privilege
 
 ---
 
-## avb_audio_analyzer.py
+## avtp_audio_analyzer.py
 
 ### Usage
 
 ```
-python3 avb_audio_analyzer.py <pcap> [options]
+python3 avtp_audio_analyzer.py <pcap> [options]
 ```
 
 ### Arguments
@@ -66,16 +66,16 @@ python3 avb_audio_analyzer.py <pcap> [options]
 
 ```bash
 # Basic analysis of a capture file
-python3 avb_audio_analyzer.py capture.pcap
+python3 avtp_audio_analyzer.py capture.pcap
 
 # Extract audio to WAV
-python3 avb_audio_analyzer.py capture.pcap --wav output.wav
+python3 avtp_audio_analyzer.py capture.pcap --wav output.wav
 
 # Filter by source device and extract channel 1
-python3 avb_audio_analyzer.py capture.pcap --src-mac 00:11:22:33:44:55 --channel 1
+python3 avtp_audio_analyzer.py capture.pcap --src-mac 00:11:22:33:44:55 --channel 1
 
 # Analyze a 96kHz stream
-python3 avb_audio_analyzer.py capture.pcap --sample-rate 96000
+python3 avtp_audio_analyzer.py capture.pcap --sample-rate 96000
 ```
 
 ### Analysis Report
@@ -92,11 +92,11 @@ The tool outputs a report containing:
 
 ---
 
-## avb_controller.py
+## atdecc_controller.py
 
 ### Overview
 
-`avb_controller.py` is a minimal ATDECC controller built around the three IEEE 1722.1-2021 protocols:
+`atdecc_controller.py` is a minimal ATDECC controller built around the three IEEE 1722.1-2021 protocols:
 
 - **ADP** -- AVDECC Discovery Protocol. Listens for periodic `ENTITY_AVAILABLE` advertisements to find devices.
 - **ACMP** -- AVDECC Connection Management Protocol. Establishes and tears down stream connections between talkers and listeners.
@@ -110,11 +110,11 @@ Raw `AF_PACKET` sockets require either root or the `CAP_NET_RAW` capability:
 
 ```bash
 # Option A: run with sudo (simplest)
-sudo python3 avb_controller.py discover
+sudo python3 atdecc_controller.py discover
 
 # Option B: grant CAP_NET_RAW to the Python interpreter (one-time)
 sudo setcap cap_net_raw+ep $(readlink -f $(which python3))
-python3 avb_controller.py discover
+python3 atdecc_controller.py discover
 ```
 
 The script prints a warning to stderr if it is not running as root.
@@ -124,7 +124,7 @@ The script prints a warning to stderr if it is not running as root.
 All commands operate on a single Ethernet interface, which must be the one connected to the AVB network. The default is `enp5s0f3u4` -- almost certainly not what you want -- so override it with `--interface`/`-i`:
 
 ```bash
-sudo python3 avb_controller.py -i eno1 discover
+sudo python3 atdecc_controller.py -i eno1 discover
 ip -br link  # list interfaces if you're not sure
 ```
 
@@ -133,7 +133,7 @@ The interface should be up, have a MAC address, and ideally be on a switch that 
 ### Usage
 
 ```
-sudo python3 avb_controller.py [--interface IFACE] <command> [args]
+sudo python3 atdecc_controller.py [--interface IFACE] <command> [args]
 ```
 
 ### Global Options
@@ -167,7 +167,7 @@ sudo python3 avb_controller.py [--interface IFACE] <command> [args]
 Listens for ADP `ENTITY_AVAILABLE` advertisements and asynchronously fires AECP `READ_DESCRIPTOR` requests for each new entity to fetch its name, stream input/output descriptors, and (if needed) `STRINGS` descriptors for stream names. Prints a summary table when the discovery window expires; with `--streams`, also prints a per-entity breakdown of stream descriptors and their supported format ranges.
 
 ```
-sudo python3 avb_controller.py discover [--duration SECONDS] [--streams]
+sudo python3 atdecc_controller.py discover [--duration SECONDS] [--streams]
 ```
 
 | Option | Default | Description |
@@ -178,9 +178,9 @@ sudo python3 avb_controller.py discover [--duration SECONDS] [--streams]
 **Examples:**
 
 ```bash
-sudo python3 avb_controller.py discover
-sudo python3 avb_controller.py -i eno1 discover --duration 10
-sudo python3 avb_controller.py -i eno1 discover -s
+sudo python3 atdecc_controller.py discover
+sudo python3 atdecc_controller.py -i eno1 discover --duration 10
+sudo python3 atdecc_controller.py -i eno1 discover -s
 ```
 
 **Summary table columns:**
@@ -213,7 +213,7 @@ Entity ID                  Name                 Model ID                   Roles
 Sends AECP `GET_STREAM_INFO` for indices 0-3 of both `STREAM_OUTPUT` and `STREAM_INPUT` on a single entity, stopping when an index returns `NO_SUCH_DESCRIPTOR`. Resolves the entity's MAC by listening briefly for ADP, falling back to EUI-64 → EUI-48 derivation if no advertisement arrives in time.
 
 ```
-sudo python3 avb_controller.py stream-info <entity_id>
+sudo python3 atdecc_controller.py stream-info <entity_id>
 ```
 
 | Argument | Description |
@@ -239,7 +239,7 @@ sudo python3 avb_controller.py stream-info <entity_id>
 **Example:**
 
 ```bash
-sudo python3 avb_controller.py stream-info 00:1b:21:ff:fe:01:02:03
+sudo python3 atdecc_controller.py stream-info 00:1b:21:ff:fe:01:02:03
 ```
 
 ---
@@ -249,7 +249,7 @@ sudo python3 avb_controller.py stream-info 00:1b:21:ff:fe:01:02:03
 Sends ACMP `CONNECT_RX_COMMAND` to the listener (via the well-known ACMP multicast `91:e0:f0:01:00:00`) to bind one of its stream input sinks to one of the talker's stream output sources. With `--format`, first sends AECP `SET_STREAM_FORMAT` to both endpoints (talker output 0 and listener input 0) so they agree on rate / bit depth / channel count. The listener forwards a `CONNECT_TX_COMMAND` to the talker as part of the standard ACMP handshake; the controller prints both responses if it sees them and exits non-zero on a non-`SUCCESS` final status.
 
 ```
-sudo python3 avb_controller.py connect <talker_entity_id> <listener_entity_id>
+sudo python3 atdecc_controller.py connect <talker_entity_id> <listener_entity_id>
                                        [--format FMT] [--match-supported] [--class-b]
                                        [--talker-uid N] [--listener-uid N]
 ```
@@ -273,14 +273,14 @@ sudo python3 avb_controller.py connect <talker_entity_id> <listener_entity_id>
 
 ```bash
 # Connect talker stream 0 to listener stream 0 (most common case)
-sudo python3 avb_controller.py connect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06
+sudo python3 atdecc_controller.py connect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06
 
 # Force AAF 48 kHz on both ends, then connect
-sudo python3 avb_controller.py connect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06 \
+sudo python3 atdecc_controller.py connect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06 \
     --format aaf-48k
 
 # Connect talker output #1 to listener input #2
-sudo python3 avb_controller.py connect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06 \
+sudo python3 atdecc_controller.py connect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06 \
     --talker-uid 1 --listener-uid 2
 ```
 
@@ -291,7 +291,7 @@ sudo python3 avb_controller.py connect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04
 Sends ACMP `DISCONNECT_RX_COMMAND` to the listener for a specific stream input. Does not change stream formats.
 
 ```
-sudo python3 avb_controller.py disconnect <talker_entity_id> <listener_entity_id>
+sudo python3 atdecc_controller.py disconnect <talker_entity_id> <listener_entity_id>
                                           [--talker-uid N] [--listener-uid N]
 ```
 
@@ -308,7 +308,7 @@ sudo python3 avb_controller.py disconnect <talker_entity_id> <listener_entity_id
 **Example:**
 
 ```bash
-sudo python3 avb_controller.py disconnect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06
+sudo python3 atdecc_controller.py disconnect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06
 ```
 
 ---
@@ -318,7 +318,7 @@ sudo python3 avb_controller.py disconnect 00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe
 Sends ACMP `GET_TX_STATE_COMMAND` to a specific talker stream output. Useful for confirming how many listeners a talker believes are subscribed -- the `Connection Count` field in the response is the authoritative number from the talker's perspective. Helpful when the listener and talker disagree about a connection's state.
 
 ```
-sudo python3 avb_controller.py get-tx-state <talker_id> <talker_uid>
+sudo python3 atdecc_controller.py get-tx-state <talker_id> <talker_uid>
 ```
 
 | Argument | Description |
@@ -329,7 +329,7 @@ sudo python3 avb_controller.py get-tx-state <talker_id> <talker_uid>
 **Example:**
 
 ```bash
-sudo python3 avb_controller.py get-tx-state 00:1b:21:ff:fe:01:02:03 0
+sudo python3 atdecc_controller.py get-tx-state 00:1b:21:ff:fe:01:02:03 0
 ```
 
 ---
@@ -340,17 +340,17 @@ Gets or sets the active CLOCK_SOURCE index for a CLOCK_DOMAIN descriptor.
 Useful for testing internal/gPTP vs CRF/media-clock clock-domain scenarios.
 
 ```
-sudo python3 avb_controller.py clock-source <entity_id> [--clock-domain N] [--set SOURCE_INDEX]
+sudo python3 atdecc_controller.py clock-source <entity_id> [--clock-domain N] [--set SOURCE_INDEX]
 ```
 
 Examples:
 
 ```bash
 # Read CLOCK_DOMAIN[0] current source
-sudo python3 avb_controller.py -i eno1 clock-source 00:1b:21:ff:fe:01:02:03
+sudo python3 atdecc_controller.py -i eno1 clock-source 00:1b:21:ff:fe:01:02:03
 
 # Set CLOCK_DOMAIN[0] to CLOCK_SOURCE[1]
-sudo python3 avb_controller.py -i eno1 clock-source 00:1b:21:ff:fe:01:02:03 --set 1
+sudo python3 atdecc_controller.py -i eno1 clock-source 00:1b:21:ff:fe:01:02:03 --set 1
 ```
 
 CRF/media-clock streams can be connected with the normal `connect` command by selecting the CRF stream UIDs, for example `--talker-uid 1 --listener-uid 1` on devices whose CRF stream is index 1.
@@ -362,7 +362,7 @@ CRF/media-clock streams can be connected with the normal `connect` command by se
 Sends AECP `SET_CONTROL` to the entity's `CONTROL[0]` IDENTIFY control -- the standard way to make a device physically announce itself (e.g. blink an LED). The value is a one-byte `uint8`: `1` starts identifying, `0` clears it.
 
 ```
-sudo python3 avb_controller.py identify <entity_id> [--value N]
+sudo python3 atdecc_controller.py identify <entity_id> [--value N]
 ```
 
 | Argument | Description |
@@ -376,8 +376,8 @@ sudo python3 avb_controller.py identify <entity_id> [--value N]
 **Examples:**
 
 ```bash
-sudo python3 avb_controller.py identify 00:1b:21:ff:fe:01:02:03
-sudo python3 avb_controller.py identify 00:1b:21:ff:fe:01:02:03 --value 0
+sudo python3 atdecc_controller.py identify 00:1b:21:ff:fe:01:02:03
+sudo python3 atdecc_controller.py identify 00:1b:21:ff:fe:01:02:03 --value 0
 ```
 
 ---
@@ -387,7 +387,7 @@ sudo python3 avb_controller.py identify 00:1b:21:ff:fe:01:02:03 --value 0
 Gets or sets the entity's `CONTROL[1]` Speaker Volume. With no `--set-db`, sends `GET_CONTROL` and prints the current value; with `--set-db`, sends `SET_CONTROL`. The value is a signed int16 in tenths of a dB, so `--set-db` is given in dB and rounded to the nearest 0.1 dB on the wire.
 
 ```
-sudo python3 avb_controller.py volume <entity_id> [--set-db DB]
+sudo python3 atdecc_controller.py volume <entity_id> [--set-db DB]
 ```
 
 | Argument | Description |
@@ -402,10 +402,10 @@ sudo python3 avb_controller.py volume <entity_id> [--set-db DB]
 
 ```bash
 # Read current speaker volume
-sudo python3 avb_controller.py volume 00:1b:21:ff:fe:01:02:03
+sudo python3 atdecc_controller.py volume 00:1b:21:ff:fe:01:02:03
 
 # Set speaker volume to -6 dB
-sudo python3 avb_controller.py volume 00:1b:21:ff:fe:01:02:03 --set-db -6
+sudo python3 atdecc_controller.py volume 00:1b:21:ff:fe:01:02:03 --set-db -6
 ```
 
 ---
@@ -415,7 +415,7 @@ sudo python3 avb_controller.py volume 00:1b:21:ff:fe:01:02:03 --set-db -6
 Gets or sets the entity's `CONTROL[2]` Mic Gain, using the same get/set semantics and tenths-of-a-dB int16 encoding as [`volume`](#volume).
 
 ```
-sudo python3 avb_controller.py mic-gain <entity_id> [--set-db DB]
+sudo python3 atdecc_controller.py mic-gain <entity_id> [--set-db DB]
 ```
 
 | Argument | Description |
@@ -430,10 +430,10 @@ sudo python3 avb_controller.py mic-gain <entity_id> [--set-db DB]
 
 ```bash
 # Read current mic gain
-sudo python3 avb_controller.py mic-gain 00:1b:21:ff:fe:01:02:03
+sudo python3 atdecc_controller.py mic-gain 00:1b:21:ff:fe:01:02:03
 
 # Set mic gain to +12 dB
-sudo python3 avb_controller.py mic-gain 00:1b:21:ff:fe:01:02:03 --set-db 12
+sudo python3 atdecc_controller.py mic-gain 00:1b:21:ff:fe:01:02:03 --set-db 12
 ```
 
 ---
@@ -443,7 +443,7 @@ sudo python3 avb_controller.py mic-gain 00:1b:21:ff:fe:01:02:03 --set-db 12
 Sends ACMP `DISCONNECT_TX_COMMAND` straight to a talker, bypassing the normal listener-driven flow. This is a diagnostic tool for probing how a talker's ACMP state machine reacts to an explicit disconnect (or for clearing stuck listener registrations on misbehaving talkers). Most networks should use `disconnect` instead.
 
 ```
-sudo python3 avb_controller.py direct-disconnect-tx <talker_id> <listener_id> <talker_uid> <listener_uid>
+sudo python3 atdecc_controller.py direct-disconnect-tx <talker_id> <listener_id> <talker_uid> <listener_uid>
 ```
 
 | Argument | Description |
@@ -456,7 +456,7 @@ sudo python3 avb_controller.py direct-disconnect-tx <talker_id> <listener_id> <t
 **Example:**
 
 ```bash
-sudo python3 avb_controller.py direct-disconnect-tx \
+sudo python3 atdecc_controller.py direct-disconnect-tx \
     00:1b:21:ff:fe:01:02:03 00:1b:21:ff:fe:04:05:06 0 0
 ```
 
@@ -471,7 +471,7 @@ The `descriptor` argument accepts either a known name or a numeric type (decimal
 `entity`, `configuration`, `audio_unit`, `stream_input`, `stream_output`, `strings`, `control`, `avb_interface`, `clock_source`, `memory_object`, `locale`, `stream_port_input`, `stream_port_output`, `audio_cluster`, `audio_map`, `clock_domain`.
 
 ```
-sudo python3 avb_controller.py read-descriptor <entity_id> <descriptor> [--index N] [--config-index N]
+sudo python3 atdecc_controller.py read-descriptor <entity_id> <descriptor> [--index N] [--config-index N]
 ```
 
 | Argument | Description |
@@ -488,10 +488,10 @@ sudo python3 avb_controller.py read-descriptor <entity_id> <descriptor> [--index
 
 ```bash
 # Dump the entity descriptor (name, model id, firmware, config count)
-sudo python3 avb_controller.py read-descriptor 00:1b:21:ff:fe:01:02:03 entity
+sudo python3 atdecc_controller.py read-descriptor 00:1b:21:ff:fe:01:02:03 entity
 
 # Read STRINGS descriptor #1
-sudo python3 avb_controller.py read-descriptor 00:1b:21:ff:fe:01:02:03 strings --index 1
+sudo python3 atdecc_controller.py read-descriptor 00:1b:21:ff:fe:01:02:03 strings --index 1
 ```
 
 ---
@@ -501,7 +501,7 @@ sudo python3 avb_controller.py read-descriptor 00:1b:21:ff:fe:01:02:03 strings -
 Sends AECP `GET_AVB_INFO` for an `AVB_INTERFACE` descriptor and prints the entity's *runtime* gPTP/SRP state. Unlike `read-descriptor avb_interface` -- which returns the interface's own clock identity -- `GET_AVB_INFO` reports which grandmaster (BTC) the device is actually synchronized to, along with its domain, capability flags, and measured propagation delay.
 
 ```
-sudo python3 avb_controller.py avb-info <entity_id> [--index N]
+sudo python3 atdecc_controller.py avb-info <entity_id> [--index N]
 ```
 
 | Argument | Description |
@@ -529,7 +529,7 @@ If the entity does not implement `GET_AVB_INFO`, the command prints the AECP sta
 **Example:**
 
 ```bash
-sudo python3 avb_controller.py avb-info 00:1b:21:ff:fe:01:02:03
+sudo python3 atdecc_controller.py avb-info 00:1b:21:ff:fe:01:02:03
 ```
 
 ---
@@ -539,7 +539,7 @@ sudo python3 avb_controller.py avb-info 00:1b:21:ff:fe:01:02:03
 Sends `READ_DESCRIPTOR` for each well-known descriptor type in turn and times the response round-trip. Useful for benchmarking AECP responsiveness end-to-end (e.g. a wired endpoint vs one reached through a Wi-Fi bridge) and for seeing at a glance which descriptors an entity actually implements.
 
 ```
-sudo python3 avb_controller.py harvest <entity_id> [--index N] [--timeout SECONDS] [--repeat N]
+sudo python3 atdecc_controller.py harvest <entity_id> [--index N] [--timeout SECONDS] [--repeat N]
 ```
 
 | Argument | Description |
@@ -560,7 +560,7 @@ Output is a per-descriptor table (`descriptor`, `status`, `rtt_ms`, `resp_bytes`
 
 ```bash
 # Time every descriptor, three samples each
-sudo python3 avb_controller.py harvest 00:1b:21:ff:fe:01:02:03 --repeat 3
+sudo python3 atdecc_controller.py harvest 00:1b:21:ff:fe:01:02:03 --repeat 3
 ```
 
 ---
@@ -594,21 +594,21 @@ A typical workflow for bringing up a single stream between two devices:
 
 ```bash
 # 1. Find the entities on your AVB interface.
-sudo python3 avb_controller.py -i eno1 discover -s
+sudo python3 atdecc_controller.py -i eno1 discover -s
 
 # 2. Inspect the talker's outputs and the listener's inputs.
-sudo python3 avb_controller.py -i eno1 stream-info 00:1b:21:ff:fe:aa:bb:cc   # talker
-sudo python3 avb_controller.py -i eno1 stream-info 00:1b:21:ff:fe:dd:ee:ff   # listener
+sudo python3 atdecc_controller.py -i eno1 stream-info 00:1b:21:ff:fe:aa:bb:cc   # talker
+sudo python3 atdecc_controller.py -i eno1 stream-info 00:1b:21:ff:fe:dd:ee:ff   # listener
 
 # 3. Set both endpoints to AAF 48 kHz and connect.
-sudo python3 avb_controller.py -i eno1 connect \
+sudo python3 atdecc_controller.py -i eno1 connect \
     00:1b:21:ff:fe:aa:bb:cc 00:1b:21:ff:fe:dd:ee:ff --format aaf-48k
 
 # 4. Verify the talker sees the new listener.
-sudo python3 avb_controller.py -i eno1 get-tx-state 00:1b:21:ff:fe:aa:bb:cc 0
+sudo python3 atdecc_controller.py -i eno1 get-tx-state 00:1b:21:ff:fe:aa:bb:cc 0
 
 # 5. Tear it down when done.
-sudo python3 avb_controller.py -i eno1 disconnect \
+sudo python3 atdecc_controller.py -i eno1 disconnect \
     00:1b:21:ff:fe:aa:bb:cc 00:1b:21:ff:fe:dd:ee:ff
 ```
 
@@ -828,7 +828,7 @@ sudo python3 mrp_applicant.py -i eno1 talker 00:1b:21:01:02:03:00:01 \
 
 `avtp_streamer.py` synthesizes a sine wave and transmits it as an AVTP audio stream. It builds correct headers for either AAF (IEEE 1722-2016 §7) or IEC 61883-6 AM824 (§9), interleaves PCM samples across N channels, and paces packets at the SR class A (8000 pps) or class B (4000 pps) rate. The first M channels carry the sine wave; the remaining N-M channels carry silence -- useful for testing channel routing and rendering on listeners without needing real audio source hardware.
 
-This is a generator-only tool -- it does not negotiate MSRP or ATDECC. Use `mrp_applicant.py` or `avb_controller.py` to set up reservation / connection state first if your target listener needs them.
+This is a generator-only tool -- it does not negotiate MSRP or ATDECC. Use `mrp_applicant.py` or `atdecc_controller.py` to set up reservation / connection state first if your target listener needs them.
 
 ### Permissions
 
@@ -909,7 +909,7 @@ Exits non-zero (`2`) if it could not deliver at least 99.9% of the requested sam
 
 ### Pairing with the analyzer
 
-`avtp_streamer.py` emits frames in the exact layout `avb_audio_analyzer.py` parses, so a Wireshark capture of a stream produced by this tool can be fed straight into the analyzer:
+`avtp_streamer.py` emits frames in the exact layout `avtp_audio_analyzer.py` parses, so a Wireshark capture of a stream produced by this tool can be fed straight into the analyzer:
 
 ```bash
 # In one terminal, stream for 30 s.
@@ -918,12 +918,12 @@ sudo python3 avtp_streamer.py -i eno1 \
 
 # In another, capture and analyze.
 sudo tshark -i eno1 -f 'ether proto 0x22f0' -a duration:30 -w stream.pcap
-python3 avb_audio_analyzer.py stream.pcap --wav out.wav
+python3 avtp_audio_analyzer.py stream.pcap --wav out.wav
 ```
 
 ### Troubleshooting
 
 - **Listener hears clicks or dropouts** -- check the "Actual pps / Actual sample rate" lines on the summary. If they're significantly below target, the host can't keep up with the SR-class cadence; try a lower channel count, switch to SR class B (`--sr-class B`), or reduce `--sample-rate`.
-- **No audio at the listener even though packets are flowing** -- the listener may need an explicit ACMP connection (`avb_controller.py connect ...`) or an MSRP reservation (`mrp_applicant.py talker ...`) before it accepts the stream. Streaming raw AVTP onto the wire is not enough for compliant listeners.
+- **No audio at the listener even though packets are flowing** -- the listener may need an explicit ACMP connection (`atdecc_controller.py connect ...`) or an MSRP reservation (`mrp_applicant.py talker ...`) before it accepts the stream. Streaming raw AVTP onto the wire is not enough for compliant listeners.
 - **Listener mutes the inactive channels** -- intended behavior; channels `[--active-channels..--channels)` carry exact zeros. Increase `--active-channels` if you want signal on more channels.
 - **`unsupported sample rate` error** -- AAF and AM824 only encode a fixed set of rates; see the `--sample-rate` row above.

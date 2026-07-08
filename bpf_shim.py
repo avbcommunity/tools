@@ -34,7 +34,7 @@ class _BpfProgram(ctypes.Structure):
 
 
 class MacBpfSocket:
-    def __init__(self, interface: str, ethertype: int = ETH_P_AVTP):
+    def __init__(self, interface: str, ethertype=ETH_P_AVTP):
         fd = None
         for i in range(256):
             try:
@@ -53,14 +53,19 @@ class MacBpfSocket:
         fcntl.ioctl(fd, BIOCIMMEDIATE, struct.pack("I", 1))
         fcntl.ioctl(fd, BIOCSHDRCMPLT, struct.pack("I", 1))
         fcntl.ioctl(fd, BIOCSSEESENT, struct.pack("I", 1))
-        # ldh [12]; jeq <ethertype> ? accept : drop
-        self._insns = (_BpfInsn * 4)(
-            _BpfInsn(0x28, 0, 0, 12),
-            _BpfInsn(0x15, 0, 1, ethertype),
-            _BpfInsn(0x06, 0, 0, 0xFFFFFFFF),
-            _BpfInsn(0x06, 0, 0, 0),
-        )
-        prog = _BpfProgram(4, self._insns)
+        # ldh [12]; jeq <ethertype[i]> ? accept : next / drop.
+        # `ethertype` may be a single value or an iterable of them.
+        ets = (ethertype,) if isinstance(ethertype, int) else tuple(ethertype)
+        n = len(ets)
+        insns = [_BpfInsn(0x28, 0, 0, 12)]
+        for i, et in enumerate(ets):
+            jt = n - 1 - i           # skip remaining jeqs to the accept
+            jf = 0 if i < n - 1 else 1  # last mismatch falls to the drop
+            insns.append(_BpfInsn(0x15, jt, jf, et))
+        insns.append(_BpfInsn(0x06, 0, 0, 0xFFFFFFFF))
+        insns.append(_BpfInsn(0x06, 0, 0, 0))
+        self._insns = (_BpfInsn * len(insns))(*insns)
+        prog = _BpfProgram(len(insns), self._insns)
         fcntl.ioctl(fd, BIOCSETF, bytes(prog))
         # Multicast dst (ADP/ACMP 91:e0:f0:01:00:00) needs promiscuous RX.
         fcntl.ioctl(fd, BIOCPROMISC, 0)

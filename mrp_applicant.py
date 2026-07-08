@@ -256,6 +256,34 @@ def recv_frame(sock: socket.socket, timeout: float):
     return src, dst, ethertype, data[offset:]
 
 
+if sys.platform == "darwin":
+    # macOS has no AF_PACKET; use the BPF backend (bpf_shim.py, same
+    # directory) with a kernel filter on the MRP ethertypes.
+    import os as _os
+    from bpf_shim import MacBpfSocket, recv_raw_ts  # noqa: F811
+    from bpf_shim import get_mac_address as get_interface_mac  # noqa: F811
+
+    def open_raw_socket(interface):  # noqa: F811
+        return MacBpfSocket(interface, ethertype=(ETH_P_MSRP, ETH_P_MVRP))
+
+    def send_frame(sock, interface, dest_mac, src_mac, ethertype,
+                   payload):  # noqa: F811
+        frame = struct.pack("!6s6sH", dest_mac, src_mac, ethertype) + payload
+        if len(frame) < 60:
+            frame += b"\x00" * (60 - len(frame))
+        _os.write(sock.fd, frame)
+
+    def recv_frame(sock, timeout):  # noqa: F811
+        r = recv_raw_ts(sock, timeout)
+        if r is None:
+            return None
+        _ts, dst, src, ethertype, payload = r
+        if ethertype == ETH_P_VLAN and len(payload) >= 4:
+            ethertype = struct.unpack("!H", payload[2:4])[0]
+            payload = payload[4:]
+        return src, dst, ethertype, payload
+
+
 # ---------------------------------------------------------------------------
 # MRPDU encoding
 # ---------------------------------------------------------------------------

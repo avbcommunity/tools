@@ -24,17 +24,17 @@ Uses raw AF_PACKET sockets (Linux) or BPF via `bpf_shim.py` (macOS) with etherty
 
 MSRP/MVRP test applicant. Acts as an MRP applicant for MSRP (IEEE 802.1Qat) and MVRP (IEEE 802.1ak): declares Talker, Listener, Domain, and VLAN attributes to a connected switch, decodes incoming MRPDUs, and prints a per-run summary with pass/fail expectations. Useful for verifying that a bridge has SR class / MSRP configured correctly and that VLAN registration is working before bringing up real streams.
 
-Uses raw AF_PACKET sockets with ethertypes 0x22EA (MSRP) and 0x88F5 (MVRP). Requires root privileges or `CAP_NET_RAW`.
+Uses raw AF_PACKET sockets (Linux) or BPF via `bpf_shim.py` (macOS) with ethertypes 0x22EA (MSRP) and 0x88F5 (MVRP). Requires root privileges or `CAP_NET_RAW` (Linux).
 
-**Dependencies:** Python 3 (standard library only). Linux only.
+**Dependencies:** Python 3 (plus `bpf_shim.py` on macOS). Linux and macOS.
 
 ### `avtp_streamer.py`
 
 AVTP PCM stream generator. Synthesizes a continuous sine wave and transmits it as an AAF or IEC 61883-6 AM824 AVTP stream paced at the SR class A (8000 pps) or class B (4000 pps) rate. The stream carries N total channels; the first M are filled with PCM and the remaining N-M carry silence. Configurable destination MAC, StreamID, sample rate, bit depth, frequency, amplitude, duration, and optional 802.1Q tag. Useful for driving a listener under test or exercising MSRP reservations end-to-end without needing real audio source hardware.
 
-Uses raw AF_PACKET sockets with ethertype 0x22F0 (AVTP). Requires root privileges or `CAP_NET_RAW`.
+Uses raw AF_PACKET sockets (Linux) or BPF via `bpf_shim.py` (macOS) with ethertype 0x22F0 (AVTP). Requires root privileges or `CAP_NET_RAW` (Linux). On macOS expect slightly more pacing jitter than on Linux -- fine for a test-signal generator.
 
-**Dependencies:** Python 3 (standard library only). Linux only.
+**Dependencies:** Python 3 (plus `bpf_shim.py` on macOS). Linux and macOS.
 
 ### `gptp_inspector.py`
 

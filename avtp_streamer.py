@@ -154,6 +154,25 @@ def open_tx_socket(interface: str) -> socket.socket:
     return sock
 
 
+def raw_send(sock, frame: bytes, interface: str) -> None:
+    sock.sendto(frame, (interface, 0))
+
+
+if sys.platform == "darwin":
+    # macOS has no AF_PACKET; transmit through the BPF backend
+    # (bpf_shim.py, same directory). Expect a little more pacing
+    # jitter than on Linux -- fine for a test-signal generator.
+    import os as _os
+    from bpf_shim import MacBpfSocket  # noqa: F811
+    from bpf_shim import get_mac_address as get_interface_mac  # noqa: F811
+
+    def open_tx_socket(interface):  # noqa: F811
+        return MacBpfSocket(interface, ethertype=ETH_P_AVTP)
+
+    def raw_send(sock, frame, interface):  # noqa: F811
+        _os.write(sock.fd, frame)
+
+
 def build_eth_header(dst: bytes, src: bytes, vlan: int, pcp: int) -> bytes:
     """Build an Ethernet (II) header, optionally with a single 802.1Q tag."""
     if vlan is None:
@@ -418,7 +437,7 @@ def stream(sock: socket.socket, interface: str, args, src_mac: bytes) -> int:
             frame = eth_prefix + avtp_pdu
             if len(frame) < 60:
                 frame += b"\x00" * (60 - len(frame))
-            sock.sendto(frame, (interface, 0))
+            raw_send(sock, frame, interface)
 
             seq = (seq + 1) & 0xFF
             sample_idx += this_n

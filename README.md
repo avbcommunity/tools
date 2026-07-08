@@ -16,9 +16,9 @@ Supports both numpy-accelerated analysis (FFT, SNR, THD, phase continuity) and a
 
 ATDECC (IEEE 1722.1-2021) controller for managing AVB stream connections on a local network. Discovers AVB entities via ADP, connects and disconnects talkers and listeners via ACMP, queries stream info via AECP, and can set stream formats before connecting.
 
-Uses raw AF_PACKET sockets with ethertype 0x22F0 (AVTP/ATDECC). Requires root privileges or `CAP_NET_RAW` capability.
+Uses raw AF_PACKET sockets (Linux) or BPF via `bpf_shim.py` (macOS) with ethertype 0x22F0 (AVTP/ATDECC). Requires root privileges or `CAP_NET_RAW` (Linux).
 
-**Dependencies:** Python 3 (standard library only). Linux only (uses `AF_PACKET` sockets).
+**Dependencies:** Python 3 (standard library only). Linux and macOS (macOS needs `bpf_shim.py` next to the script; see "macOS support and limitations").
 
 ### `mrp_applicant.py`
 
@@ -35,6 +35,31 @@ AVTP PCM stream generator. Synthesizes a continuous sine wave and transmits it a
 Uses raw AF_PACKET sockets with ethertype 0x22F0 (AVTP). Requires root privileges or `CAP_NET_RAW`.
 
 **Dependencies:** Python 3 (standard library only). Linux only.
+
+### `gptp_inspector.py`
+
+Live decoder for gPTP (IEEE 802.1AS, ethertype 0x88F7) frames on a macOS
+interface, using the same BPF backend as the controller. Shows per-packet
+message type, sequence, source port identity and body fields (Announce
+priority vector, Follow_Up origin timestamp + correction, Pdelay requesting
+port), with per-type rate summaries. **Sees inbound frames only on AVB-capable
+Macs** — see the note under `gptp_monitor_macos.py` for why, and for the outbound view.
+
+**Dependencies:** Python 3, `bpf_shim.py`, root. macOS only.
+
+### `gptp_monitor_macos.py`
+
+Reports a Mac's **outbound** gPTP activity — the part no packet capture on
+macOS can see. Apple's `IOgPTPPlugin.kext` builds 802.1AS frames in the
+kernel and hands them to the NIC driver's realtime transmit queue, below
+both BPF and pktap, so Wireshark/tshark on the Mac show only inbound PTP.
+The kext publishes per-port state and counters in the IORegistry
+(`IOTimeSyncEthernetPort`); this tool polls them and reports outbound
+Sync/Announce/Pdelay rates, asCapable, link propagation delay, sync
+interval, inferred port role, the local and received priority vectors, and
+any movement in the RX-discard reason counters. No root needed.
+
+**Dependencies:** Python 3 (standard library only). macOS only.
 
 ---
 
@@ -118,6 +143,47 @@ python3 atdecc_controller.py discover
 ```
 
 The script prints a warning to stderr if it is not running as root.
+
+On macOS there is no capability equivalent; `/dev/bpf*` requires root, so run
+every command with `sudo`.
+
+### macOS support and limitations
+
+On macOS the controller transparently swaps its socket layer for a BPF
+backend (`bpf_shim.py`, which must sit in the same directory). A kernel-side
+BPF filter accepts only untagged ethertype 0x22F0 frames, so VLAN-tagged AVTP
+media streams never reach the tool even on a port carrying live audio.
+
+What works, verified against both an ESP32 endpoint and the Mac's own
+virtual entity (`avbutil --virtual-audio`):
+
+- **ADP discovery** -- including the local Mac's own entities. BPF is set to
+  see the interface's own transmissions, so the Mac's virtual entity and its
+  controller show up in `discover` output alongside remote devices.
+- **AECP** -- read descriptors, stream info, and `SET_STREAM_FORMAT`, against
+  remote entities and (usually) the local Mac's entity. Unicast frames
+  addressed to the interface's own MAC hairpin into the local ATDECC stack.
+- **ACMP against remote entities** -- connect / disconnect / state queries
+  work normally.
+
+Known limitations when the *target* is the macOS entity itself:
+
+- **Same-host multicast does not hairpin.** Frames injected through BPF
+  egress the wire but are not looped into the local stack, so ACMP
+  (multicast per spec) sent *from the Mac to its own entity* gets no
+  response. Run the controller on another host for that -- over the wire
+  the macOS listener accepts external `CONNECT_RX` / `DISCONNECT_RX`
+  normally. Unicast AECP to the interface's own MAC does hairpin, which is
+  why enumeration and format changes work locally.
+- **`SET_STREAM_FORMAT` returns `STREAM_IS_RUNNING`** while the stream is
+  connected or its CoreAudio engine holds the device -- disconnect the
+  stream first (or idle the engine) and retry; after a talker disappears
+  allow ~10 s for the departure to register.
+- **`SET_SAMPLING_RATE` is ignored.** Change the Mac device rate locally
+  (CoreAudio / Audio MIDI Setup), not over AVDECC.
+- macOS fast-connect re-establishes saved connections when the remote
+  talker's entity reappears, but only with the format it bound with -- it
+  will not re-bind an AAF-bound input to a talker now offering AM824.
 
 ### Picking the network interface
 
@@ -927,3 +993,4 @@ python3 avtp_audio_analyzer.py stream.pcap --wav out.wav
 - **No audio at the listener even though packets are flowing** -- the listener may need an explicit ACMP connection (`atdecc_controller.py connect ...`) or an MSRP reservation (`mrp_applicant.py talker ...`) before it accepts the stream. Streaming raw AVTP onto the wire is not enough for compliant listeners.
 - **Listener mutes the inactive channels** -- intended behavior; channels `[--active-channels..--channels)` carry exact zeros. Increase `--active-channels` if you want signal on more channels.
 - **`unsupported sample rate` error** -- AAF and AM824 only encode a fixed set of rates; see the `--sample-rate` row above.
+

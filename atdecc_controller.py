@@ -351,6 +351,13 @@ def recv_frame(sock: socket.socket, timeout: float = 0.1):
     return src_mac, payload
 
 
+if sys.platform == "darwin":
+    # macOS has no AF_PACKET; use the BPF backend (see bpf_shim.py and
+    # "macOS support and limitations" in the README).
+    from bpf_shim import (open_raw_socket, get_mac_address, send_frame,
+                          recv_frame)  # noqa: F811
+
+
 # ---------------------------------------------------------------------------
 # ADP parsing
 # ---------------------------------------------------------------------------

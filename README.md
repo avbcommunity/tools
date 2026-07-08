@@ -1,6 +1,6 @@
 # tools
 
-Community tools for testing AVB (Audio Video Bridging) networks. Includes a packet capture audio analyzer, an ATDECC network controller, an MSRP/MVRP test applicant, and an AVTP PCM stream generator.
+Community tools for testing AVB (Audio Video Bridging) networks. Includes a packet capture audio analyzer, an ATDECC network controller, an MSRP/MVRP test applicant, an AVTP PCM stream generator, and a live MSRP/SRP reservation dashboard.
 
 ## Scripts
 
@@ -60,6 +60,14 @@ interval, inferred port role, the local and received priority vectors, and
 any movement in the RX-discard reason counters. No root needed.
 
 **Dependencies:** Python 3 (standard library only). macOS only.
+
+### `msrp_dashboard.py`
+
+Live terminal dashboard of MSRP/SRP stream reservations. Sniffs MSRP (IEEE 802.1Qat, ethertype 0x22EA) with `tshark` and shows, per Stream ID, the current Talker declaration (Advertise, or Failed with its failure code), the Listener declaration (Ready / Asking Failed / Ready Failed), whether the reservation is complete, how fresh each side is, and a rolling event log of RESERVATION UP/LOST transitions. Built to make an intermittently-flapping reservation -- the usual cause of audio that cuts out while a controller still shows "connected" -- visible in real time. Captures several interfaces at once and can replay a saved pcap.
+
+Captures via `tshark`/`dumpcap`, so no raw-socket privileges are needed when you are in the `wireshark` group.
+
+**Dependencies:** Python 3, `tshark` (Wireshark), and `rich` (installed automatically when run with `uv`).
 
 ---
 
@@ -994,3 +1002,81 @@ python3 avtp_audio_analyzer.py stream.pcap --wav out.wav
 - **Listener mutes the inactive channels** -- intended behavior; channels `[--active-channels..--channels)` carry exact zeros. Increase `--active-channels` if you want signal on more channels.
 - **`unsupported sample rate` error** -- AAF and AM824 only encode a fixed set of rates; see the `--sample-rate` row above.
 
+---
+
+## msrp_dashboard.py
+
+### Overview
+
+A live, full-screen terminal dashboard of MSRP / SRP stream reservations. It captures MSRP (IEEE 802.1Qat, ethertype 0x22EA) with `tshark` and maintains, per Stream ID, the talker's advertise plus **each listener** subscribed to it (grouped beneath the stream), tracking:
+
+- **Talker** (stream header row) -- `ADV` (declaring a Talker Advertise) with its SR class, or `FAIL` with the 802.1Q failure code and the bridge that reported it.
+- **Listener** (one indented sub-row per listener) -- `RDY` (Listener Ready), `ASK-FAIL` (Asking Failed), `RDY-FAIL` (Ready Failed), or `IGN`.
+- **Rsv** (per listener) -- `YES` (confirmed), `YES?` (held but not re-seen within the MRP re-declaration cycle), `no` (torn down / explicit Leave), or `-` (listener seen but no matching talker advertise yet). Timed to the Milan reservation lifetime -- see [Reading the dashboard](#reading-the-dashboard).
+
+A rolling event log records every transition (`RESERVATION UP` / `RESERVATION LOST`, talker Advertise<->Failed, listener state changes) so a reservation that flaps -- the classic cause of intermittent audio while a controller still shows "connected" -- is visible as it happens.
+
+Stream IDs are rendered as `talker-MAC/unique-id` (the first six bytes of a Stream ID are the talker's MAC), so the true source is readable at a glance even when the immediate sender is a bridge relaying the attribute.
+
+### Permissions
+
+No raw-socket privileges are required if `dumpcap` has capture capabilities and you are in the `wireshark` group (the usual Wireshark install). Otherwise run with sufficient privilege to capture on the interface.
+
+### Usage
+
+```
+uv run msrp_dashboard.py -i <iface> [-i <iface> ...]
+uv run msrp_dashboard.py -r <capture.pcap>
+```
+
+`uv` reads the script's inline metadata and installs `rich` on first run. (Plain `python3 msrp_dashboard.py ...` also works if `rich` is already present.)
+
+Capture on **more than one interface** when the talker and listener sit on different links, and tap each side at its **source** egress: the talker's own link (where it originates Talker Advertise) and the listener's own link (where it originates Listener Ready — usually the chattiest copy). A registered MRP attribute is only *guaranteed* to be re-sent once per LeaveAll (~10-15 s), and the *relayed* copy that reaches the far end is sparser still — so a single-link view, or one that leans on the relayed/ingress side, can make a healthy reservation read `YES?` or drop to `no`. The tool applies the capture filter **per interface** internally, so adding more `-i` never accidentally pulls in the (VLAN-tagged) audio stream.
+
+### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `-i`, `--interface IFACE` | *(required unless `-r`)* | Capture interface. Repeat to watch several at once. |
+| `-r`, `--read FILE` | *(none)* | Read from a pcap/pcapng instead of live capture. |
+| `--confirm SECONDS` | `= --leaveall-max` | Freshness window for **confirmed** (`YES`): a declaration re-seen within this counts as fresh. Defaults to one guaranteed MRP re-declaration cycle. |
+| `--leavetime SECONDS` | `5` | MSRP LeaveTime (Milan v1.3). Registrar holds a registration this long after a LeaveAll before removing it. |
+| `--leaveall-max SECONDS` | `15.5` | Max `leavealltimer` (Milan tolerance). The reservation-lost ceiling is `leaveall-max + leavetime` (~20.5 s). |
+| `--forget SECONDS` | `60` | Drop a stream row this long after its last update. |
+| `--filter BPF` | `ether proto 0x22ea` | Override the capture filter. |
+| `--no-color` | *(off)* | Plain output. |
+
+Press `Ctrl-C` to quit; a one-line summary of streams seen prints on exit.
+
+### Reading the dashboard
+
+- **`Rsv`** is the signal that matters -- a Milan talker only transmits while a matching Listener Ready is registered (IEEE 1722.1 / Milan 5.5). It has three states, timed to the MRP reservation lifetime rather than a guess:
+  - **`YES`** (green) -- Talker Advertise + Listener Ready both re-seen within one guaranteed re-declaration cycle (`--leaveall-max`).
+  - **`YES?`** (yellow) -- still held, but not re-seen recently (past `leaveall-max`, within `leaveall-max + leavetime`). Almost always a tap or re-declaration gap, **not** a dropout -- MRP applicants go quiet between LeaveAlls, so a distant declaration may simply not cross your tap every cycle.
+  - **`no`** (red) -- torn down: an explicit MRP **Leave** (debounced ~2 s so a transient `Mt` — which appears in normal operation — or an immediate re-Join isn't misread as a teardown; per Milan 4.2.7.2.2), a Talker Failed, a non-Ready listener, or no refresh past the `leaveall-max + leavetime` ceiling.
+- **Timers** default to Milan v1.3 Table 4.3 (LeaveTime 5 s, leavealltimer 10-15 s), which override 802.1Q Table 10-7 (LeaveTime 0.6-1 s). Set `--leavetime` / `--leaveall-max` for a non-Milan network.
+- **Rows are grouped: one header per Stream ID, one indented `└ <MAC>` sub-row per listener.** The Stream ID (its first six bytes are the talker's MAC) prints once on the header row with the talker's `State`, `Dest MAC` and `Lat`; each listener appears beneath it with its own `State`, per-listener `Rsv`, age and interface. A stream with a talker but nobody subscribed shows `└ (no listener)`. The listener MAC is the `eth.src` that carried the Listener declaration -- the *immediate sender*, which on a relayed link is the bridge, not the listener itself. There is deliberately **no Talker MAC column**: the talker is already named by the Stream ID (it survives relays), and because MRP is hop-by-hop an immediate-sender column would just flip between the talker and each relaying switch. Trust the Stream ID for who the talker is.
+- **You usually see one listener per stream, even with several subscribed.** MSRP aggregates: each bridge merges all downstream listeners into a *single* declaration on its upstream port, so on the talker's segment you see one listener sub-row -- the switch's merged state, carrying the *switch's* MAC. To see individual devices as separate rows, tap each listener's own access link, where it declares Ready with its own MAC. If a link to a given listener can't be tapped, its state is only visible folded into the switch's merged declaration.
+- **A listener sub-row may be a bridge, not an end device.** Because MRP re-declares hop-by-hop, a switch registers its downstream listeners, merges them, and emits its *own* Listener Ready (FourPackedEvent = Ready) toward the talker with its *own* source MAC. So a listener MAC belonging to a switch (e.g. a PreSonus `00:0a:92:…`) is that switch declaring on behalf of **everything behind it** -- treat that row as "the aggregate state of all listeners downstream of that bridge." The tool can't label it as a relay the way it omits a Talker MAC column: a talker's identity is embedded in the Stream ID, but a **listener's identity is carried nowhere in the MSRP attribute** -- the only listener info on the wire is the sender's MAC -- so a bridge's merged declaration and a real end-listener are indistinguishable to any sniffer. A tell-tale in the raw capture: a bridge's Listener frame often bundles many streams from several talkers in one vector, which a single end device wouldn't.
+- **The `events` panel has a fixed header** (`Time · Event · Stream ID / MAC · Detail`). The `Event` column names the scope: `talker` / `listener` declaration changes, derived `reserve` (RESERVATION UP/LOST) transitions, and `leaveall`. Stream-scoped rows key on the Stream ID; a `leaveall` keys on the sender's MAC.
+- **LeaveAll shows as an event, not a stream.** A periodic MRP LeaveAll is an empty vector attribute (`Number of Values = 0`) that tshark renders with an all-zero placeholder First Value. The tool never tracks it as a phantom `00:00:…:00/0000` stream, but it **does** log it in the event panel as a blue `LeaveAll (talker|listener|domain)` line — tagged with the attribute message it rode in, and rate-limited per source+scope so multi-tap copies aren't repeated — handy for correlating when reservations refresh.
+- **A talker only appears when it's declaring.** Classic-AVB talkers (e.g. macOS) advertise a stream **only once a listener connects**; Milan talkers advertise every stream output continuously. So an idle classic talker with nothing connected shows no row at all -- that's expected, not a capture problem.
+
+### Examples
+
+```
+# Tap each side at its source: talker egress + listener egress.
+uv run msrp_dashboard.py -i enp2s0f2 -i enp2s0f0
+
+# Replay a saved MSRP capture.
+uv run msrp_dashboard.py -r msrp.pcap
+
+# Non-Milan network: use the 802.1Q LeaveTime instead of Milan's 5 s.
+uv run msrp_dashboard.py -i eno1 --leavetime 1
+```
+
+### Troubleshooting
+
+- **A stream shows `YES?` or flips to `no` but audio is playing** -- the Listener Ready is registered but isn't re-crossing your tap between MRP LeaveAll cycles, or the listener is behind a bridge on a link you are not capturing. `YES?` already accounts for this; if it reaches `no`, add the listener's own link with another `-i`, or (non-Milan) set `--leavetime`/`--leaveall-max` to match your bridge.
+- **Failures on streams you do not care about** -- the dashboard shows every MSRP stream on the wire. `FAIL` rows for other talkers (for example a Class-B bandwidth shortage elsewhere) do not affect your reservation.
+- **Nothing appears** -- confirm MSRP is actually on the chosen interface (`tshark -i <iface> -f 'ether proto 0x22ea'`) and that SR is enabled on the bridge.

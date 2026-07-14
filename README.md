@@ -2,8 +2,8 @@
 
 Community tools for testing AVB (Audio Video Bridging) networks: an ATDECC
 controller, an MSRP/MVRP test applicant, a live SRP reservation dashboard, an
-AVTP stream generator, a capture-based audio analyzer, and two gPTP
-inspection tools.
+AVTP stream generator, a capture-based audio analyzer, two gPTP
+inspection tools, and a self-healing macOS stream monitor.
 
 ## Tool index
 
@@ -16,6 +16,7 @@ inspection tools.
 | [`avtp_audio_analyzer.py`](#avtp_audio_analyzerpy) | Extract and analyze PCM audio from AVTP captures | any (offline) | none |
 | [`gptp_inspector.py`](#gptp_inspectorpy) | Live decoder for 802.1AS frames with direction tagging | Linux, macOS | root / `CAP_NET_RAW` |
 | [`gptp_monitor_macos.py`](#gptp_monitor_macospy) | Report a Mac's outbound gPTP state (invisible to packet capture) | macOS | none |
+| [`stream_monitor_macos.swift`](#stream_monitor_macosswift) | Self-healing play-through monitor: render a Mac's AVB stream input to any output device | macOS | none |
 
 `bpf_shim.py` is not a tool: it is the raw-Ethernet backend the others load
 automatically on macOS and must sit in the same directory as them.
@@ -685,6 +686,96 @@ python3 gptp_monitor_macos.py [options]
 python3 gptp_monitor_macos.py --mac d0:11 -i 3        # live rates + role
 python3 gptp_monitor_macos.py --once                  # raw property dump
 ```
+
+---
+
+## stream_monitor_macos.swift
+
+Live play-through monitor for an AVB stream a Mac is listening to: opens the
+Mac's AVB CoreAudio input device (the virtual entity), taps one channel,
+sample-rate-converts, and renders it to any CoreAudio output device — a
+headphone jack, a USB codec feeding a measurement rig, or the speakers.
+Built for unattended bench monitoring where DAW monitor paths give up:
+it ignores CoreAudio configuration-change notifications entirely (they
+storm and also miss real stalls), and instead watches its own frame
+counters — if audio stops flowing for ~5 s it tears the engines down and
+rebuilds, and if a device is missing it retries every 2 s. CoreAudio HAL
+calls that hang (a wedged coreaudiod can block `AVAudioEngine` start or
+teardown forever) are handled by a watchdog that exits the process
+(rc=42) so a supervisor can relaunch a fresh HAL client.
+
+Build on the Mac (no Xcode project needed, just the command-line tools):
+
+```bash
+swiftc -O -swift-version 5 stream_monitor_macos.swift -o stream_monitor_macos
+```
+
+Usage:
+
+```bash
+./stream_monitor_macos list      # enumerate input/output devices with rates
+./stream_monitor_macos run [--input SUBSTR] [--output SUBSTR|default]
+                           [--channel N] [--gain DB] [--buffer MS]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--input SUBSTR` | `Ethernet` | Input device name substring (the AVB virtual entity appears as e.g. `Mac mini:Ethernet` once a stream input is bound). |
+| `--output SUBSTR` | system default | Output device name substring, or `default`. |
+| `--channel N` | `0` | Which stream channel to monitor. |
+| `--gain DB` | `0` | Output gain in dB. |
+| `--buffer MS` | `200` | Ring buffer depth; absorbs the clock drift between the AVB stream and the output DAC (drop-oldest on overflow). |
+
+It prints an attach line on every (re)build and a stats line every 10 s
+(`in=`/`out=` frame counters, ring fill, over/underruns, restarts) — useful
+as render-health telemetry in logs.
+
+For unattended operation run it under the supervisor wrapper
+(`stream_monitor_macos.sh`, relaunches on watchdog exits) or as a launchd
+agent so it starts at login and is relaunched automatically:
+
+```xml
+<!-- ~/Library/LaunchAgents/com.example.stream_monitor.plist -->
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.stream_monitor</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/you/stream_monitor_macos</string>
+    <string>run</string>
+    <string>--input</string><string>Ethernet</string>
+    <string>--output</string><string>default</string>
+  </array>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>3</integer>
+  <key>StandardOutPath</key><string>/Users/you/stream_monitor.log</string>
+  <key>StandardErrorPath</key><string>/Users/you/stream_monitor.log</string>
+</dict>
+</plist>
+```
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.stream_monitor.plist
+```
+
+### Troubleshooting
+
+- **`waiting (no input device matching ...)`** — the AVB CoreAudio device
+  only materializes while a stream input is bound (ACMP) and a user is
+  logged in; the tool attaches by itself once it appears.
+- **Input exists but delivers silence** — macOS microphone privacy may be
+  gating the launching context; run it once from a local Terminal to
+  trigger the prompt, or grant under System Settings → Privacy & Security
+  → Microphone.
+- **Repeated `exited rc=42` relaunches** — a HAL call hung, usually a
+  wedged/dead coreaudiod. If coreaudiod will not respawn (SIP blocks
+  `kickstart`/`bootout`/`killall` for it), only a reboot recovers audio.
+- **Do not clock the Mac from a CRF stream while monitoring** — on
+  current macOS builds a CRF-clocked AVB input kills coreaudiod within
+  minutes (crash in AudioDSPManager); use INPUT_STREAM clocking.
 
 ---
 

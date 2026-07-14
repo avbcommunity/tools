@@ -40,6 +40,7 @@ ACMP_MULTICAST = b"\x91\xe0\xf0\x01\x00\x00"
 
 # AVTP subtypes
 AVTP_SUBTYPE_ADP = 0xFA
+ADP_MULTICAST_MAC = bytes.fromhex("91e0f0010000")
 AVTP_SUBTYPE_AECP = 0xFB
 AVTP_SUBTYPE_ACMP = 0xFC
 
@@ -69,7 +70,13 @@ AECP_MSG_AEM_RESPONSE = 1
 # AECP command codes
 AECP_CMD_READ_DESCRIPTOR = 0x0004
 AECP_CMD_SET_STREAM_FORMAT = 0x0008
+AECP_CMD_GET_STREAM_FORMAT = 0x0009
+AECP_CMD_SET_SAMPLING_RATE = 0x0011
+AECP_CMD_GET_SAMPLING_RATE = 0x0012
 AECP_CMD_GET_STREAM_INFO = 0x000F
+# Milan v1.2 vendor-unique-free AEM extensions (Milan §5.4.2)
+AECP_CMD_SET_MAX_TRANSIT_TIME = 0x004C
+AECP_CMD_GET_MAX_TRANSIT_TIME = 0x004D
 AECP_CMD_SET_CLOCK_SOURCE = 0x0016
 AECP_CMD_GET_CLOCK_SOURCE = 0x0017
 AECP_CMD_SET_CONTROL = 0x0018
@@ -688,23 +695,34 @@ def build_aecp_set_stream_format(controller_id: bytes, target_id: bytes,
 
 
 def _resolve_mac(sock, interface: str, mac: bytes, entity_id: bytes,
-                 duration: float = 2.0) -> bytes:
-    """Resolve entity ID to MAC address via ADP, fall back to EUI-64 derivation."""
-    start = time.monotonic()
-    while time.monotonic() - start < duration:
-        result = recv_frame(sock, timeout=0.2)
-        if result is None:
-            continue
-        src_mac, payload = result
-        if len(payload) >= 12 and payload[0] == AVTP_SUBTYPE_ADP:
-            adp_eid = payload[4:12]
-            if adp_eid == entity_id:
-                return src_mac
-    # Fallback: standard EUI-64 to EUI-48 (remove FF:FE at bytes 3-4)
-    if entity_id[3:5] == b'\xff\xfe':
-        return entity_id[:3] + entity_id[5:8]
-    # Non-standard entity ID — use first 6 bytes as best guess
-    return entity_id[:6]
+                 duration: float = 2.0, retries: int = 3) -> bytes:
+    """Resolve entity ID to MAC address via ADP.
+
+    Each attempt multicasts an ENTITY_DISCOVER to solicit an immediate
+    ENTITY_AVAILABLE rather than waiting for the entity's periodic
+    announce. Exits with an error when the entity cannot be heard —
+    the old EUI-64 fallback silently fabricated a WRONG MAC for any
+    entity whose ID is not derived from its port MAC (macOS flips a
+    bit), producing commands that time out with no hint why."""
+    for _ in range(retries):
+        hdr = encode_atdecc_header(AVTP_SUBTYPE_ADP, ADP_MSG_ENTITY_DISCOVER,
+                                   0, 0, 0, 56)
+        send_frame(sock, interface, ADP_MULTICAST_MAC, mac,
+                   hdr + entity_id + bytes(48))
+        start = time.monotonic()
+        while time.monotonic() - start < duration:
+            result = recv_frame(sock, timeout=0.2)
+            if result is None:
+                continue
+            src_mac, payload = result
+            if len(payload) >= 12 and payload[0] == AVTP_SUBTYPE_ADP:
+                adp_eid = payload[4:12]
+                if adp_eid == entity_id:
+                    return src_mac
+    print(f"Error: no ADP reply from {format_entity_id(entity_id)} after "
+          f"{retries} ENTITY_DISCOVER attempts; entity offline or wrong ID "
+          f"(try 'discover').", file=sys.stderr)
+    sys.exit(1)
 
 
 def send_set_stream_format(sock, interface: str, mac: bytes, controller_id: bytes,
@@ -1775,13 +1793,8 @@ def cmd_clock_source(interface: str, entity_id_str: str,
         if resp is None:
             print(f"Timeout: no {op}_RESPONSE received within 3 seconds.")
             sys.exit(1)
-        status_name = {0: "SUCCESS", 1: "NOT_IMPLEMENTED", 2: "NO_SUCH_DESCRIPTOR",
-                       3: "ENTITY_LOCKED", 4: "ENTITY_ACQUIRED",
-                       9: "NOT_SUPPORTED", 12: "ENTITY_MISBEHAVING",
-                       13: "NOT_AUTHENTICATED", 14: "AUTHENTICATION_DISABLED",
-                       15: "BAD_ARGUMENTS", 16: "NO_RESOURCES",
-                       17: "IN_PROGRESS", 18: "ENTITY_NOT_READY",
-                       19: "STREAM_IS_RUNNING"}.get(resp["status"], f"ERROR({resp['status']})")
+        status_name = AECP_STATUS_NAMES.get(resp["status"],
+                                            f"ERROR({resp['status']})")
         print(f"\nReceived {op}_RESPONSE:")
         print(f"  Status:              {status_name}")
         print(f"  Descriptor Type:     0x{resp['descriptor_type']:04x}")
@@ -1793,12 +1806,151 @@ def cmd_clock_source(interface: str, entity_id_str: str,
         sock.close()
 
 
+# IEEE 1722.1 AEM status codes (Table 7.126)
 AECP_STATUS_NAMES = {0: "SUCCESS", 1: "NOT_IMPLEMENTED", 2: "NO_SUCH_DESCRIPTOR",
                     3: "ENTITY_LOCKED", 4: "ENTITY_ACQUIRED",
-                    9: "NOT_SUPPORTED", 12: "ENTITY_MISBEHAVING",
-                    13: "NOT_AUTHENTICATED", 14: "AUTHENTICATION_DISABLED",
-                    15: "BAD_ARGUMENTS", 16: "NO_RESOURCES",
-                    17: "IN_PROGRESS", 18: "ENTITY_NOT_READY"}
+                    5: "NOT_AUTHENTICATED", 6: "AUTHENTICATION_DISABLED",
+                    7: "BAD_ARGUMENTS", 8: "NO_RESOURCES",
+                    9: "IN_PROGRESS", 10: "ENTITY_MISBEHAVING",
+                    11: "NOT_SUPPORTED", 12: "STREAM_IS_RUNNING"}
+
+
+def _aem_command(sock, interface: str, mac: bytes, controller_id: bytes,
+                 target_id: bytes, target_mac: bytes, command_type: int,
+                 body: bytes, timeout: float = 3.0):
+    """Send one AEM command and return (status, payload) of the matching
+    response, or None on timeout."""
+    seq_id = int(time.monotonic() * 1000) & 0xFFFF
+    cdl = 20 + len(body)
+    hdr = encode_atdecc_header(AVTP_SUBTYPE_AECP, AECP_MSG_AEM_COMMAND,
+                               0, 0, 0, cdl)
+    msg = (hdr + target_id + controller_id + struct.pack("!H", seq_id)
+           + encode_aecp_aem_header(command_type) + body)
+    send_frame(sock, interface, target_mac, mac, msg)
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        result = recv_frame(sock, timeout=0.2)
+        if result is None:
+            continue
+        _, payload = result
+        if len(payload) < 24:
+            continue
+        subtype, msg_type, _sv, _ver, status, _cdl = \
+            decode_atdecc_header(payload[:4])
+        if subtype != AVTP_SUBTYPE_AECP or msg_type != AECP_MSG_AEM_RESPONSE:
+            continue
+        if payload[4:12] != target_id:
+            continue
+        rct = ((payload[22] & 0x7F) << 8) | payload[23]  # strip u bit
+        if rct != command_type:
+            continue
+        return status, payload
+    return None
+
+
+def _aem_cli_setup(interface: str, entity_id_str: str):
+    """Common preamble for the simple get/set AEM subcommands."""
+    mac = get_mac_address(interface)
+    controller_id = mac_to_entity_id(mac)
+    target_id = parse_entity_id(entity_id_str)
+    sock = open_raw_socket(interface)
+    target_mac = _resolve_mac(sock, interface, mac, target_id)
+    print(f"Interface:     {interface}")
+    print(f"Entity ID:     {entity_id_str}")
+    print(f"Entity MAC:    {format_mac(target_mac)}")
+    return sock, mac, controller_id, target_id, target_mac
+
+
+def cmd_stream_format(interface: str, entity_id_str: str, direction: str,
+                      index: int, format_hex: str = None) -> None:
+    """Get or set a STREAM_INPUT/OUTPUT stream format via AECP."""
+    desc_type = 0x0005 if direction == "input" else 0x0006
+    sock, mac, controller_id, target_id, target_mac = \
+        _aem_cli_setup(interface, entity_id_str)
+    try:
+        if format_hex is None:
+            resp = _aem_command(sock, interface, mac, controller_id,
+                                target_id, target_mac,
+                                AECP_CMD_GET_STREAM_FORMAT,
+                                struct.pack("!HH", desc_type, index))
+            op = "GET_STREAM_FORMAT"
+        else:
+            fmt = bytes.fromhex(format_hex.replace(":", ""))
+            if len(fmt) != 8:
+                print("Error: FORMAT must be 8 bytes of hex", file=sys.stderr)
+                sys.exit(2)
+            resp = _aem_command(sock, interface, mac, controller_id,
+                                target_id, target_mac,
+                                AECP_CMD_SET_STREAM_FORMAT,
+                                struct.pack("!HH", desc_type, index) + fmt)
+            op = "SET_STREAM_FORMAT"
+        if resp is None:
+            print(f"Timeout: no {op}_RESPONSE received.")
+            sys.exit(1)
+        status, payload = resp
+        print(f"{op} {direction}[{index}]: "
+              f"{AECP_STATUS_NAMES.get(status, f'ERROR({status})')}")
+        if len(payload) >= 36:
+            fmt = payload[28:36]
+            print(f"  Format: {fmt.hex()} ({_format_stream_format(fmt)})")
+        sys.exit(0 if status == 0 else 1)
+    finally:
+        sock.close()
+
+
+def cmd_sampling_rate(interface: str, entity_id_str: str, rate_hz: int = None,
+                      descriptor_index: int = 0) -> None:
+    """Get or set the AUDIO_UNIT current sampling rate via AECP."""
+    sock, mac, controller_id, target_id, target_mac = \
+        _aem_cli_setup(interface, entity_id_str)
+    try:
+        body = struct.pack("!HH", 0x0002, descriptor_index)  # AUDIO_UNIT
+        if rate_hz is None:
+            cmd, op = AECP_CMD_GET_SAMPLING_RATE, "GET_SAMPLING_RATE"
+        else:
+            cmd, op = AECP_CMD_SET_SAMPLING_RATE, "SET_SAMPLING_RATE"
+            body += struct.pack("!I", rate_hz & 0x1FFFFFFF)
+        resp = _aem_command(sock, interface, mac, controller_id, target_id,
+                            target_mac, cmd, body)
+        if resp is None:
+            print(f"Timeout: no {op}_RESPONSE received.")
+            sys.exit(1)
+        status, payload = resp
+        rate = struct.unpack("!I", payload[28:32])[0] & 0x1FFFFFFF \
+            if len(payload) >= 32 else None
+        print(f"{op}: {AECP_STATUS_NAMES.get(status, f'ERROR({status})')}"
+              f"  rate={rate}")
+        sys.exit(0 if status == 0 else 1)
+    finally:
+        sock.close()
+
+
+def cmd_max_transit_time(interface: str, entity_id_str: str, index: int,
+                         mtt_ns: int = None) -> None:
+    """Get or set a STREAM_OUTPUT's Milan max transit time (0x004C/4D)."""
+    sock, mac, controller_id, target_id, target_mac = \
+        _aem_cli_setup(interface, entity_id_str)
+    try:
+        body = struct.pack("!HHQ", 0x0006, index,
+                           mtt_ns if mtt_ns is not None else 0)
+        cmd = AECP_CMD_GET_MAX_TRANSIT_TIME if mtt_ns is None \
+            else AECP_CMD_SET_MAX_TRANSIT_TIME
+        op = "GET_MAX_TRANSIT_TIME" if mtt_ns is None \
+            else "SET_MAX_TRANSIT_TIME"
+        resp = _aem_command(sock, interface, mac, controller_id, target_id,
+                            target_mac, cmd, body)
+        if resp is None:
+            print(f"Timeout: no {op}_RESPONSE received.")
+            sys.exit(1)
+        status, payload = resp
+        mtt = struct.unpack("!Q", payload[28:36])[0] \
+            if len(payload) >= 36 else None
+        print(f"{op} output[{index}]: "
+              f"{AECP_STATUS_NAMES.get(status, f'ERROR({status})')}"
+              f"  max_transit_time={mtt}ns")
+        sys.exit(0 if status == 0 else 1)
+    finally:
+        sock.close()
 
 
 def _cmd_control(interface: str, entity_id_str: str, control_index: int,
@@ -2332,6 +2484,37 @@ examples:
     sp_clock.add_argument("--set", dest="clock_source", type=int, default=None,
                           help="Set active CLOCK_SOURCE index; omit to get current source")
 
+    # stream-format
+    sp_fmt = subparsers.add_parser(
+        "stream-format", help="Get or set a stream's format (8-byte hex word)")
+    sp_fmt.add_argument("entity_id", help="Entity ID to query/control")
+    sp_fmt.add_argument("direction", choices=["input", "output"],
+                        help="STREAM_INPUT or STREAM_OUTPUT")
+    sp_fmt.add_argument("--index", type=int, default=0,
+                        help="Stream descriptor index (default 0)")
+    sp_fmt.add_argument("--set", dest="format_hex", default=None,
+                        help="8-byte format word as hex; omit to get current")
+
+    # sampling-rate
+    sp_rate = subparsers.add_parser(
+        "sampling-rate", help="Get or set the AUDIO_UNIT sampling rate")
+    sp_rate.add_argument("entity_id", help="Entity ID to query/control")
+    sp_rate.add_argument("--index", type=int, default=0,
+                         help="AUDIO_UNIT descriptor index (default 0)")
+    sp_rate.add_argument("--set", dest="rate_hz", type=int, default=None,
+                         help="Sampling rate in Hz; omit to get current")
+
+    # max-transit-time
+    sp_mtt = subparsers.add_parser(
+        "max-transit-time",
+        help="Get or set a STREAM_OUTPUT Milan max transit time")
+    sp_mtt.add_argument("entity_id", help="Talker entity ID")
+    sp_mtt.add_argument("--index", type=int, default=0,
+                        help="STREAM_OUTPUT descriptor index (default 0)")
+    sp_mtt.add_argument("--set", dest="mtt_ns", type=int, default=None,
+                        help="Max transit time in ns; omit to get current "
+                             "(SET requires the stream stopped)")
+
     # identify
     sp_identify = subparsers.add_parser(
         "identify", help="Trigger an entity's CONTROL[0] IDENTIFY control")
@@ -2429,6 +2612,15 @@ examples:
         cmd_clock_source(args.interface, args.entity_id,
                          clock_domain_index=args.clock_domain,
                          clock_source_index=args.clock_source)
+    elif args.command == "stream-format":
+        cmd_stream_format(args.interface, args.entity_id, args.direction,
+                          args.index, args.format_hex)
+    elif args.command == "sampling-rate":
+        cmd_sampling_rate(args.interface, args.entity_id, args.rate_hz,
+                          args.index)
+    elif args.command == "max-transit-time":
+        cmd_max_transit_time(args.interface, args.entity_id, args.index,
+                             args.mtt_ns)
     elif args.command == "identify":
         cmd_identify(args.interface, args.entity_id, value=args.value)
     elif args.command == "volume":

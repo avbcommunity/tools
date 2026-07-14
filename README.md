@@ -147,6 +147,9 @@ sudo python3 atdecc_controller.py [--interface IFACE] <command> [args]
 | `disconnect` | Tell a listener to unsubscribe from a talker's stream. |
 | `get-tx-state` | Ask a talker how many listeners are connected to one of its outputs. |
 | `clock-source` | Get or set an entity CLOCK_DOMAIN active CLOCK_SOURCE index. |
+| `stream-format` | Get or set a STREAM_INPUT/OUTPUT format word without reconnecting. |
+| `sampling-rate` | Get or set the AUDIO_UNIT current sampling rate. |
+| `max-transit-time` | Get or set a talker's Milan max transit time (presentation offset). |
 | `identify` | Trigger an entity's CONTROL[0] IDENTIFY (e.g. blink an LED). |
 | `volume` | Get or set CONTROL[1] Speaker Volume (dB). |
 | `mic-gain` | Get or set CONTROL[2] Mic Gain (dB). |
@@ -243,6 +246,37 @@ between internal, gPTP, and CRF/media-clock domains.
 
 ```
 sudo python3 atdecc_controller.py clock-source <entity_id> [--clock-domain N] [--set SOURCE_INDEX]
+```
+
+#### `stream-format`
+
+Gets or sets one stream's 8-byte format word directly (the `connect`
+command can also set formats as part of a connection; this one works on
+either end, standalone). Most entities refuse SET while the stream is
+running — disconnect first.
+
+```
+sudo python3 atdecc_controller.py stream-format <entity_id> input|output [--index N] [--set FORMAT_HEX]
+```
+
+#### `sampling-rate`
+
+Gets or sets the AUDIO_UNIT current sampling rate (Hz). Note that many
+devices refuse or ignore SET (macOS answers NOT_SUPPORTED; some
+endpoints change rate only through `stream-format`).
+
+```
+sudo python3 atdecc_controller.py sampling-rate <entity_id> [--index N] [--set HZ]
+```
+
+#### `max-transit-time`
+
+Gets or sets a STREAM_OUTPUT's Milan max transit time (the talker's
+presentation-time offset, in nanoseconds; Milan v1.2 §5.4.2.29). SET is
+refused with STREAM_IS_RUNNING while the stream is active.
+
+```
+sudo python3 atdecc_controller.py max-transit-time <talker_entity_id> [--index N] [--set NS]
 ```
 
 #### `identify`, `volume`, `mic-gain`

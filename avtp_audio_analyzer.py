@@ -470,7 +470,11 @@ def analyze_audio_numpy(samples, sample_rate, bit_depth):
     if n == 0:
         return {"error": "No samples to analyze"}
 
-    max_val = (1 << (bit_depth - 1)) - 1
+    # The packet parsers always extract the top 24 bits of the 32-bit
+    # container, so samples are in 24-bit domain regardless of the wire
+    # bit_depth. Deriving full scale from bit_depth misreads
+    # --bit-depth 32 by 48 dB.
+    max_val = (1 << 23) - 1
     duration = n / sample_rate
 
     results["total_samples"] = n
@@ -757,7 +761,11 @@ def analyze_audio_basic(samples, sample_rate, bit_depth):
     if n == 0:
         return {"error": "No samples to analyze"}
 
-    max_val = (1 << (bit_depth - 1)) - 1
+    # The packet parsers always extract the top 24 bits of the 32-bit
+    # container, so samples are in 24-bit domain regardless of the wire
+    # bit_depth. Deriving full scale from bit_depth misreads
+    # --bit-depth 32 by 48 dB.
+    max_val = (1 << 23) - 1
     duration = n / sample_rate
 
     peak = max(abs(s) for s in samples)

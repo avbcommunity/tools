@@ -1476,7 +1476,8 @@ def cmd_connect(interface: str, talker_id_str: str, listener_id_str: str,
     when the desired format's exact byte encoding isn't in the device's list
     (e.g. AAF PCM32 vs PCM24 byte-3 differences).
 
-    With class_b=True the ACMP flags field is sent with bit 15 (CLASS_B) set
+    With class_b=True the ACMP flags field is sent with the CLASS_B flag
+    (0x0001, IEEE 1722.1-2021 Table 8-4) set
     per IEEE 1722.1-2021 §8.2.1.16 Table 8-4, selecting SR Class B
     (priority 2, 250 µs observation interval) for this connection. Default
     (False) requests Class A (priority 3, 125 µs).
@@ -1557,7 +1558,7 @@ def cmd_connect(interface: str, talker_id_str: str, listener_id_str: str,
                   ACMP_MSG_CONNECT_RX_COMMAND, "CONNECT_RX_COMMAND",
                   ACMP_MSG_CONNECT_RX_RESPONSE, "CONNECT_RX_RESPONSE",
                   talker_uid=talker_uid, listener_uid=listener_uid,
-                  flags=(0x8000 if class_b else 0))
+                  flags=(0x0001 if class_b else 0))
 
 
 def cmd_disconnect(interface: str, talker_id_str: str, listener_id_str: str,
@@ -2453,7 +2454,7 @@ examples:
                                 "Options: am824-48k, am824-44.1k, am824-96k, aaf-48k, aaf-44.1k, aaf-96k, "
                                 "am824 (alias for am824-48k), aaf (alias for aaf-48k), 61883 (alias for am824-48k)")
     sp_connect.add_argument("--class-b", "-b", action="store_true",
-                           help="Set ACMP CLASS_B flag (bit 15) so the talker "
+                           help="Set ACMP CLASS_B flag (0x0001) so the talker "
                                 "configures this connection as SR Class B "
                                 "(priority 2, 250 us observation interval). "
                                 "Default = Class A (priority 3, 125 us).")

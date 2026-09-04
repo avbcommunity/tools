@@ -996,7 +996,8 @@ def main():
     parser.add_argument("--sample-rate", type=int, default=48000,
                         help="Assumed sample rate in Hz (default: 48000)")
     parser.add_argument("--bit-depth", type=int, default=24,
-                        help="Assumed bit depth (default: 24)")
+                        help="WAV sample width: 16 writes 16-bit, larger writes 24-bit; "
+                             "does not affect analysis (default: 24)")
     args = parser.parse_args()
 
     if not os.path.isfile(args.pcap):

@@ -637,7 +637,12 @@ python3 avtp_audio_analyzer.py <pcap> [options]
 | `--src-mac MAC` | *(none)* | Filter by source MAC. |
 | `--channel N` | `0` | Channel index to extract. |
 | `--sample-rate HZ` | `48000` | Fallback rate for IEC 61883-6 (AAF auto-detects). |
-| `--bit-depth BITS` | `24` | Bit depth for analysis scaling. |
+| `--bit-depth BITS` | `24` | WAV sample width only: `16` writes a 16-bit file, anything larger writes 24-bit. Has no effect on the analysis. |
+
+Samples are always decoded as the top 24 bits of each 32-bit container, so
+the level figures (peak / RMS / fundamental dBFS) are relative to 24-bit
+full scale whatever bit depth the stream advertises: a Milan PCM32 stream
+and a PCM24 stream carrying the same signal report the same dBFS.
 
 pcapng input is auto-converted via `editcap` (from Wireshark).
 

@@ -263,7 +263,7 @@ def extract_avtp_audio(pcap_path, src_mac_filter=None, channel=0,
         "channels_detected": detected_channels,
         "sample_rate_detected": detected_rate,
         "seq_gaps": seq_gaps,
-        "duration": (len(samples) / sample_rate) if samples else 0,
+        "duration": (len(samples) / (detected_rate or sample_rate)) if samples else 0,
     }
 
     return samples, packet_info, stream_info

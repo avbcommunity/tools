@@ -999,12 +999,14 @@ def cmd_listener(args, sock, src_mac) -> int:
     leave_pdu = _build_listener_pdu(stream_id, MRP_EVENT_LV, listener_type)
     domain_pdu = _build_domain_pdu(sr["id"], pcp, vid, MRP_EVENT_JOININ)
 
-    if args.send_domain:
-        send_frame(sock, args.interface, MSRP_DEST_MAC, src_mac,
-                   ETH_P_MSRP, domain_pdu)
-        tracker.msrp_tx += 1
-
     def send_listener():
+        # The Domain repeats with the Listener: a bridge drops a Domain
+        # registration that is not re-declared after its LeaveAll, and
+        # stops propagating the stream to this port.
+        if args.send_domain:
+            send_frame(sock, args.interface, MSRP_DEST_MAC, src_mac,
+                       ETH_P_MSRP, domain_pdu)
+            tracker.msrp_tx += 1
         send_frame(sock, args.interface, MSRP_DEST_MAC, src_mac,
                    ETH_P_MSRP, listener_pdu)
         tracker.msrp_tx += 1

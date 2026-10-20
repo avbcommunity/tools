@@ -83,6 +83,11 @@ def main():
     port.dtr = False
     port.rts = False
     port.open()
+    # The ESP-Prog-2 can be left at 115200 after the open changes the
+    # control lines, so send the rate again. The USB driver only sends a
+    # rate that differs from its last one, hence the detour.
+    port.baudrate = 19200 if args.baud == 9600 else 9600
+    port.baudrate = args.baud
     hold_lines_and_clear_hupcl(port.fileno())
 
     logfile = open(args.logfile, "ab", buffering=0)

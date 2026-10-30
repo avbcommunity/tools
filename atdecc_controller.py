@@ -476,9 +476,9 @@ def build_aecp_read_descriptor(controller_id: bytes, target_id: bytes,
     # AECP common: header(4) + target_entity_id(8) + controller_entity_id(8) + seq_id(2) = 22
     # AEM header: 2 bytes
     # configuration_index(2) + reserved(2) + descriptor_type(2) + descriptor_index(2) = 8
-    # Total body (control_data_len) = 22 - 4 + 2 + 8 = 28
-    # control_data_len = total after header = 18 + 2 + 8 = 28
-    control_data_len = 28  # bytes after the 4-byte header
+    # control_data_len counts the octets after target_entity_id
+    # (IEEE 1722.1-2021 9.2.2.6): 8 + 2 + 2 + 8 = 20
+    control_data_len = 20
 
     header = encode_atdecc_header(AVTP_SUBTYPE_AECP, AECP_MSG_AEM_COMMAND,
                                   0, 0, 0, control_data_len)
@@ -677,9 +677,9 @@ def build_aecp_set_stream_format(controller_id: bytes, target_id: bytes,
     Wire layout (aecp_stream_format_s = 36 bytes):
       header(4) + target_entity_id(8) + controller_entity_id(8) + seq_id(2)
       + aem_header(2) + descriptor_type(2) + descriptor_index(2) + stream_format(8)
-    control_data_len = 36 - 4 = 32
+    control_data_len = 36 - 12 = 24 (the octets after target_entity_id)
     """
-    control_data_len = 32
+    control_data_len = 24
 
     header = encode_atdecc_header(AVTP_SUBTYPE_AECP, AECP_MSG_AEM_COMMAND,
                                   0, 0, 0, control_data_len)
@@ -851,7 +851,7 @@ def build_aecp_clock_source(controller_id: bytes, target_id: bytes,
     reserved uint16. Responses mirror the command family.
     """
     is_set = command_type == AECP_CMD_SET_CLOCK_SOURCE
-    control_data_len = 28 if is_set else 24
+    control_data_len = 20 if is_set else 16  # after target_entity_id
     header = encode_atdecc_header(AVTP_SUBTYPE_AECP, AECP_MSG_AEM_COMMAND,
                                   0, 0, 0, control_data_len)
     aem = encode_aecp_aem_header(command_type)
@@ -941,7 +941,7 @@ def build_aecp_control(controller_id: bytes, target_id: bytes,
     CONTROL[1]/[2] volume/gain as signed int16 tenths of dB.
     """
     values = _encode_control_value(control_index, value, value_type)
-    control_data_len = 18 + 2 + 4 + len(values)
+    control_data_len = 10 + 2 + 4 + len(values)  # after target_entity_id
     header = encode_atdecc_header(AVTP_SUBTYPE_AECP, AECP_MSG_AEM_COMMAND,
                                   0, 0, 0, control_data_len)
     aem = encode_aecp_aem_header(command_type)
@@ -1101,8 +1101,8 @@ def build_aecp_get_stream_info(controller_id: bytes, target_id: bytes,
                                descriptor_index: int = 0) -> bytes:
     """Build an AECP GET_STREAM_INFO command."""
     # Uses aecp_aem_short_s format: common(22) + aem(2) + desc_type(2) + desc_index(2) = 28
-    # control_data_len = 28 - 4 = 24
-    control_data_len = 24
+    # control_data_len = 28 - 12 = 16 (the octets after target_entity_id)
+    control_data_len = 16
 
     header = encode_atdecc_header(AVTP_SUBTYPE_AECP, AECP_MSG_AEM_COMMAND,
                                   0, 0, 0, control_data_len)
@@ -1822,7 +1822,7 @@ def _aem_command(sock, interface: str, mac: bytes, controller_id: bytes,
     """Send one AEM command and return (status, payload) of the matching
     response, or None on timeout."""
     seq_id = int(time.monotonic() * 1000) & 0xFFFF
-    cdl = 20 + len(body)
+    cdl = 12 + len(body)
     hdr = encode_atdecc_header(AVTP_SUBTYPE_AECP, AECP_MSG_AEM_COMMAND,
                                0, 0, 0, cdl)
     msg = (hdr + target_id + controller_id + struct.pack("!H", seq_id)
@@ -2034,9 +2034,9 @@ def _parse_descriptor_type(s: str) -> int:
 def build_aecp_get_avb_info(controller_id: bytes, target_id: bytes,
                             seq_id: int, descriptor_index: int = 0) -> bytes:
     """Build an AECP GET_AVB_INFO command for an AVB_INTERFACE descriptor."""
-    # body after the 4-byte header: target(8)+controller(8)+seq(2)+aem(2)
-    #   + descriptor_type(2) + descriptor_index(2) = 24
-    control_data_len = 24
+    # octets after target_entity_id: controller(8)+seq(2)+aem(2)
+    #   + descriptor_type(2) + descriptor_index(2) = 16
+    control_data_len = 16
     header = encode_atdecc_header(AVTP_SUBTYPE_AECP, AECP_MSG_AEM_COMMAND,
                                   0, 0, 0, control_data_len)
     aem = encode_aecp_aem_header(AECP_CMD_GET_AVB_INFO)

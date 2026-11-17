@@ -66,6 +66,8 @@ ACMP_MSG_GET_RX_STATE_RESPONSE = 11
 # AECP message types
 AECP_MSG_AEM_COMMAND = 0
 AECP_MSG_AEM_RESPONSE = 1
+AECP_MSG_ADDRESS_ACCESS_COMMAND = 2
+AECP_MSG_ADDRESS_ACCESS_RESPONSE = 3
 
 # AECP command codes
 AECP_CMD_READ_DESCRIPTOR = 0x0004
@@ -2134,6 +2136,218 @@ def cmd_get_avb_info(interface: str, entity_id_str: str,
     print(f"(raw flags: 0x{flags:02x})")
 
 
+# ---- Console log over ATDECC (esp_avb LOG_OBJECT) ----
+#
+# esp_avb serves its console log as MEMORY_OBJECT 1 of type LOG_OBJECT:
+# a 128-byte ASCII header "AVBLOG1 total=… drop=… boot=… ring=… ptp=… ms=…"
+# then the ring, byte n of the log at base + 128 + (n % ring). Read with
+# ADDRESS_ACCESS READs, at most 496 data bytes per command.
+
+AEM_DESC_MEMORY_OBJECT = 0x000B
+MEMORY_OBJECT_TYPE_LOG = 0x0003
+LOG_HEADER_LEN = 128
+AA_MAX_DATA = 496
+AA_STATUS_NAMES = {0: "SUCCESS", 1: "NOT_IMPLEMENTED", 2: "ADDRESS_TOO_LOW",
+                   3: "ADDRESS_TOO_HIGH", 4: "ADDRESS_INVALID",
+                   5: "TLV_INVALID", 6: "DATA_INVALID", 7: "UNSUPPORTED"}
+
+
+def build_aecp_address_access_read(controller_id: bytes, target_id: bytes,
+                                   seq_id: int, reads) -> bytes:
+    """ADDRESS_ACCESS command with one READ TLV (no data) per (address,
+    length) in reads."""
+    tlvs = b"".join(struct.pack("!HQ", length & 0x0FFF, address)
+                    for address, length in reads)
+    control_data_len = 8 + 2 + 2 + len(tlvs)
+    header = encode_atdecc_header(AVTP_SUBTYPE_AECP,
+                                  AECP_MSG_ADDRESS_ACCESS_COMMAND,
+                                  0, 0, 0, control_data_len)
+    return (header + target_id + controller_id + struct.pack("!H", seq_id)
+            + struct.pack("!H", len(reads)) + tlvs)
+
+
+class _AecpLink:
+    """One controller's AECP exchanges with one entity: one command in
+    flight, response matched by sequence ID, RTT and timeout counts."""
+
+    def __init__(self, interface: str, entity_id: bytes):
+        self.interface = interface
+        self.entity_id = entity_id
+        self.mac = get_mac_address(interface)
+        self.controller_id = mac_to_entity_id(self.mac)
+        self.sock = open_raw_socket(interface)
+        self.entity_mac = _resolve_mac(self.sock, interface, self.mac,
+                                       entity_id, duration=3.0)
+        self.seq_id = int(time.monotonic() * 1000) & 0xFFFF
+        self.commands = 0
+        self.timeouts = 0
+        self.bytes_out = 0
+        self.bytes_in = 0
+        self.rtt_sum = 0.0
+        self.rtt_max = 0.0
+
+    def exchange(self, msg_builder, response_type: int, timeout: float = 0.25):
+        """Sends the message built for the next sequence ID and returns the
+        matching response payload, or None after a timeout."""
+        self.seq_id = (self.seq_id + 1) & 0xFFFF
+        msg = msg_builder(self.seq_id)
+        send_frame(self.sock, self.interface, self.entity_mac, self.mac, msg)
+        self.commands += 1
+        self.bytes_out += len(msg)
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            result = recv_frame(self.sock, timeout=0.05)
+            if result is None:
+                continue
+            _, payload = result
+            if len(payload) < 22:
+                continue
+            subtype, msg_type = decode_atdecc_header(payload[:4])[:2]
+            if subtype != AVTP_SUBTYPE_AECP or msg_type != response_type:
+                continue
+            if payload[4:12] != self.entity_id:
+                continue
+            if payload[12:20] != self.controller_id:
+                continue
+            if struct.unpack("!H", payload[20:22])[0] != self.seq_id:
+                continue
+            rtt = time.monotonic() - start
+            self.rtt_sum += rtt
+            self.rtt_max = max(self.rtt_max, rtt)
+            self.bytes_in += len(payload)
+            return payload
+        self.timeouts += 1
+        return None
+
+    def read(self, reads, retries: int = 1):
+        """ADDRESS_ACCESS READs; returns (status, [data, ...]) or None."""
+        for _ in range(retries + 1):
+            payload = self.exchange(
+                lambda seq: build_aecp_address_access_read(
+                    self.controller_id, self.entity_id, seq, reads),
+                AECP_MSG_ADDRESS_ACCESS_RESPONSE)
+            if payload is not None:
+                break
+        else:
+            return None
+        status = decode_atdecc_header(payload[:4])[4]
+        if status != 0:
+            return status, []
+        count = struct.unpack("!H", payload[22:24])[0]
+        pos, out = 24, []
+        for _ in range(count):
+            mode_length, _address = struct.unpack("!HQ", payload[pos:pos + 10])
+            length = mode_length & 0x0FFF
+            out.append(payload[pos + 10:pos + 10 + length])
+            pos += 10 + length
+        return status, out
+
+
+def _find_log_object(link: _AecpLink):
+    """The LOG_OBJECT memory object's start address, or None."""
+    for index in range(4):
+        payload = link.exchange(
+            lambda seq: build_aecp_read_descriptor(
+                link.controller_id, link.entity_id, seq,
+                AEM_DESC_MEMORY_OBJECT, index),
+            AECP_MSG_AEM_RESPONSE, timeout=1.0)
+        if payload is None or decode_atdecc_header(payload[:4])[4] != 0:
+            return None
+        body = payload[32:]
+        if len(body) < 104:
+            return None
+        object_type = struct.unpack("!H", body[66:68])[0]
+        if object_type == MEMORY_OBJECT_TYPE_LOG:
+            return struct.unpack("!Q", body[72:80])[0]
+    return None
+
+
+def _parse_log_header(header: bytes):
+    text = header.decode("ascii", "replace")
+    if not text.startswith("AVBLOG1"):
+        return None
+    fields = {}
+    for item in text.split()[1:]:
+        key, _, value = item.partition("=")
+        try:
+            fields[key] = int(value, 16)
+        except ValueError:
+            pass
+    return fields if {"total", "boot", "ring"} <= fields.keys() else None
+
+
+def cmd_log(interface: str, entity_id_str: str, follow: bool = False,
+            poll_ms: int = 250, stats: bool = False) -> None:
+    """Print an esp_avb entity's console log, read over ATDECC."""
+    entity_id = parse_entity_id(entity_id_str)
+    link = _AecpLink(interface, entity_id)
+    base = _find_log_object(link)
+    if base is None:
+        print("No LOG_OBJECT memory object on this entity", file=sys.stderr)
+        sys.exit(1)
+
+    out = sys.stdout
+    cursor = None
+    boot = None
+    empty_polls = 0
+    stats_start = stats_mark = time.monotonic()
+    bytes_shown = bytes_lost = 0
+    while True:
+        result = link.read([(base, LOG_HEADER_LEN)])
+        if result is None or result[0] != 0 or not result[1]:
+            what = ("no answer" if result is None
+                    else AA_STATUS_NAMES.get(result[0], str(result[0])))
+            print(f"[read failed: {what}]", file=sys.stderr)
+            if not follow:
+                sys.exit(1)
+            time.sleep(2.0)
+            continue
+        header = _parse_log_header(result[1][0])
+        if header is None:
+            print("[bad log header]", file=sys.stderr)
+            sys.exit(1)
+        total, ring = header["total"], header["ring"]
+        if boot is not None and header["boot"] != boot:
+            out.write("[rebooted]\n")
+            cursor = None
+        boot = header["boot"]
+        if cursor is None or cursor > total:
+            cursor = max(0, total - ring)
+        if cursor < total - ring:
+            lost = total - ring - cursor
+            out.write(f"[lost {lost} bytes]\n")
+            bytes_lost += lost
+            cursor = total - ring
+        got_data = cursor < total
+        while cursor < total:
+            position = cursor % ring
+            take = min(total - cursor, AA_MAX_DATA, ring - position)
+            result = link.read([(base + LOG_HEADER_LEN + position, take)])
+            if result is None or result[0] != 0 or not result[1]:
+                break
+            out.write(result[1][0].decode("utf-8", "replace"))
+            cursor += take
+            bytes_shown += take
+        out.flush()
+        if not follow:
+            break
+        now = time.monotonic()
+        if stats and now - stats_mark >= 10.0:
+            elapsed = now - stats_start
+            rtt_avg = link.rtt_sum / max(1, link.commands - link.timeouts)
+            print(f"[stats {elapsed:.0f} s: {link.commands / elapsed:.1f} cmd/s,"
+                  f" out {link.bytes_out / elapsed:.0f} B/s,"
+                  f" in {link.bytes_in / elapsed:.0f} B/s,"
+                  f" timeouts {link.timeouts},"
+                  f" rtt avg {rtt_avg * 1000:.1f} max {link.rtt_max * 1000:.1f} ms,"
+                  f" log {bytes_shown} B shown, {bytes_lost} B lost,"
+                  f" drop {header.get('drop', 0)}]", file=sys.stderr)
+            stats_mark = now
+        empty_polls = 0 if got_data else empty_polls + 1
+        time.sleep(poll_ms / 1000.0 if empty_polls < 4 else 1.0)
+
+
+
 def cmd_read_descriptor(interface: str, entity_id_str: str,
                         descriptor: str, descriptor_index: int = 0,
                         configuration_index: int = 0) -> None:
@@ -2429,6 +2643,17 @@ examples:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    # log
+    sp_log = subparsers.add_parser(
+        "log", help="Print an esp_avb entity's console log (LOG_OBJECT over ADDRESS_ACCESS)")
+    sp_log.add_argument("entity_id", help="Entity ID (colon-separated hex)")
+    sp_log.add_argument("--follow", "-f", action="store_true",
+                        help="Keep reading new lines")
+    sp_log.add_argument("--poll", type=int, default=250,
+                        help="Poll interval in ms while lines flow (default 250; 1 s when idle)")
+    sp_log.add_argument("--stats", action="store_true",
+                        help="Print AECP traffic and timing every 10 s (stderr)")
+
     # discover
     sp_discover = subparsers.add_parser("discover", help="Discover AVB entities on the network")
     sp_discover.add_argument(
@@ -2636,6 +2861,9 @@ examples:
         cmd_direct_disconnect_tx(args.interface, args.talker_id,
                                  args.listener_id, args.talker_uid,
                                  args.listener_uid)
+    elif args.command == "log":
+        cmd_log(args.interface, args.entity_id, args.follow, args.poll,
+                args.stats)
     elif args.command == "read-descriptor":
         cmd_read_descriptor(args.interface, args.entity_id, args.descriptor,
                             descriptor_index=args.index,

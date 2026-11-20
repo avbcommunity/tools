@@ -1143,6 +1143,14 @@ def cmd_discover(interface: str, duration: float = 5.0, show_streams: bool = Fal
     # keyed by (entity_id_str, strings_desc_index)
     strings_pending = {}  # (eid_str, strings_idx) -> [(stream_dict, string_offset), ...]
 
+    # Ask every entity to announce now (entity_id 0 is the wildcard; a
+    # control_data_length under 56 is dropped by some entities) instead of
+    # waiting for their periodic ENTITY_AVAILABLE.
+    discover_hdr = encode_atdecc_header(AVTP_SUBTYPE_ADP, ADP_MSG_ENTITY_DISCOVER,
+                                        0, 0, 0, 56)
+    send_frame(sock, interface, ADP_MULTICAST_MAC, mac,
+               discover_hdr + bytes(8) + bytes(48))
+
     start = time.monotonic()
     try:
         while time.monotonic() - start < duration:

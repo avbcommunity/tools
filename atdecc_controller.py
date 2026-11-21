@@ -84,6 +84,7 @@ AECP_CMD_GET_CLOCK_SOURCE = 0x0017
 AECP_CMD_SET_CONTROL = 0x0018
 AECP_CMD_GET_CONTROL = 0x0019
 AECP_CMD_GET_AVB_INFO = 0x0027
+AECP_CMD_GET_COUNTERS = 0x0029
 
 # AEM descriptor types (IEEE 1722.1-2021 Table 7-1)
 AEM_DESC_TYPE_ENTITY = 0x0000
@@ -2041,6 +2042,53 @@ def _parse_descriptor_type(s: str) -> int:
             f"— or pass a numeric value (decimal or 0x...).")
 
 
+# GET_COUNTERS names per descriptor type (IEEE 1722.1-2021 7.4.42; the
+# valid bit for counter n is 1 << n, and entity_specific1..8 are counters
+# 31..24). esp_avb's failover uses the AVB_INTERFACE's entity-specific
+# 1-3.
+COUNTER_NAMES = {
+    0x0009: {0: "link_up", 1: "link_down", 2: "frames_tx", 3: "frames_rx",
+             4: "rx_crc_error", 5: "gptp_gm_changed",
+             31: "failovers to Wi-Fi (entity-specific 1)",
+             30: "fail-backs to wired (entity-specific 2)",
+             29: "seconds on Wi-Fi (entity-specific 3)"},
+    0x0024: {0: "locked", 1: "unlocked"},
+}
+DESCRIPTOR_TYPE_NAMES = {"entity": 0x0000, "stream_input": 0x0005,
+                         "stream_output": 0x0006, "avb_interface": 0x0009,
+                         "clock_domain": 0x0024}
+
+
+def cmd_counters(interface: str, entity_id_str: str, descriptor: str,
+                 index: int) -> None:
+    """Read a descriptor's counters with GET_COUNTERS and print the valid
+    ones."""
+    desc_type = DESCRIPTOR_TYPE_NAMES[descriptor]
+    sock, mac, controller_id, target_id, target_mac = \
+        _aem_cli_setup(interface, entity_id_str)
+    try:
+        resp = _aem_command(sock, interface, mac, controller_id, target_id,
+                            target_mac, AECP_CMD_GET_COUNTERS,
+                            struct.pack("!HH", desc_type, index))
+    finally:
+        sock.close()
+    if resp is None:
+        print("Timeout: no GET_COUNTERS response within 3 seconds.")
+        sys.exit(1)
+    status, payload = resp
+    status_name = AECP_STATUS_NAMES.get(status, f"UNKNOWN({status})") \
+        if "AECP_STATUS_NAMES" in globals() else str(status)
+    print(f"GET_COUNTERS {descriptor}[{index}]: {status_name}")
+    if status != 0 or len(payload) < 32 + 128:
+        return
+    valid = struct.unpack("!I", payload[28:32])[0]
+    counters = struct.unpack("!32I", payload[32:160])
+    names = COUNTER_NAMES.get(desc_type, {})
+    for n in range(32):
+        if valid & (1 << n):
+            print(f"  {names.get(n, f'counter {n}'):42s} {counters[n]}")
+
+
 def build_aecp_get_avb_info(controller_id: bytes, target_id: bytes,
                             seq_id: int, descriptor_index: int = 0) -> bytes:
     """Build an AECP GET_AVB_INFO command for an AVB_INTERFACE descriptor."""
@@ -2809,6 +2857,16 @@ examples:
     sp_ai.add_argument("--index", type=int, default=0,
                        help="AVB_INTERFACE descriptor_index (default 0)")
 
+    # counters
+    sp_ct = subparsers.add_parser(
+        "counters", help="Read a descriptor's counters (GET_COUNTERS)")
+    sp_ct.add_argument("entity_id", help="Target entity ID (colon-separated hex)")
+    sp_ct.add_argument("descriptor", nargs="?", default="avb_interface",
+                       choices=sorted(DESCRIPTOR_TYPE_NAMES),
+                       help="Descriptor type (default avb_interface)")
+    sp_ct.add_argument("--index", type=int, default=0,
+                       help="Descriptor index (default 0)")
+
     # harvest
     sp_hv = subparsers.add_parser(
         "harvest",
@@ -2879,6 +2937,9 @@ examples:
     elif args.command == "avb-info":
         cmd_get_avb_info(args.interface, args.entity_id,
                          descriptor_index=args.index)
+    elif args.command == "counters":
+        cmd_counters(args.interface, args.entity_id, args.descriptor,
+                     args.index)
     elif args.command == "harvest":
         cmd_harvest(args.interface, args.entity_id,
                     descriptor_index=args.index,
